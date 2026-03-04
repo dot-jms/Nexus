@@ -50,6 +50,9 @@ Deno.serve((req) => {
         break;
 
       case "dm":
+      case "dm_request":
+      case "dm_accept":
+      case "dm_decline":
         // Forward only to the target user
         for (const [client, info] of clients) {
           if (info.name === msg.to && client.readyState === WebSocket.OPEN) {
