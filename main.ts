@@ -1,5 +1,6 @@
 // Nexus WebSocket relay server — Deno Deploy
 const clients = new Map(); // ws -> { name, tag, color, pfp }
+const publicServers = new Map(); // serverId -> server info
 
 function broadcast(data, exclude = null) {
   const msg = JSON.stringify(data);
@@ -11,7 +12,6 @@ function broadcast(data, exclude = null) {
 }
 
 Deno.serve((req) => {
-  // Health check for UptimeRobot / browser visits
   if (req.headers.get("upgrade") !== "websocket") {
     return new Response("Nexus WS server running", { status: 200 });
   }
@@ -40,24 +40,87 @@ Deno.serve((req) => {
       case "reaction":
       case "member_join":
       case "member_leave":
-      case "server_create":
-      case "server_delete":
-      case "leave_server":
       case "kick_member":
       case "role_assign":
       case "profile_update":
         broadcast(msg, ws);
         break;
 
-      case "dm":
-      case "dm_request":
-      case "dm_accept":
-      case "dm_decline":
-        // Forward only to the target user
-        for (const [client, info] of clients) {
-          if (info.name === msg.to && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(msg));
+      // ── Server lifecycle — update in-memory list ──
+      case "server_create":
+        if (msg.isPublic !== false) {
+          publicServers.set(msg.serverId, {
+            id: msg.serverId,
+            name: msg.name,
+            desc: msg.desc || "",
+            icon: msg.icon || null,
+            color: msg.color || "#6c63ff",
+            memberCount: 1,
+            createdAt: msg.createdAt || Date.now(),
+          });
+        }
+        broadcast(msg, ws);
+        break;
+
+      case "server_update":
+        if (publicServers.has(msg.serverId)) {
+          const sv = publicServers.get(msg.serverId);
+          if (msg.isPublic === false) {
+            publicServers.delete(msg.serverId);
+          } else {
+            publicServers.set(msg.serverId, { ...sv, ...msg });
           }
+        } else if (msg.isPublic === true) {
+          publicServers.set(msg.serverId, {
+            id: msg.serverId,
+            name: msg.name,
+            desc: msg.desc || "",
+            icon: msg.icon || null,
+            color: msg.color || "#6c63ff",
+            memberCount: msg.memberCount || 1,
+            createdAt: msg.createdAt || Date.now(),
+          });
+        }
+        broadcast(msg, ws);
+        break;
+
+      case "server_delete":
+      case "leave_server":
+        publicServers.delete(msg.serverId);
+        broadcast(msg, ws);
+        break;
+
+      case "join_server":
+        if (publicServers.has(msg.serverId)) {
+          const sv = publicServers.get(msg.serverId);
+          sv.memberCount = (sv.memberCount || 1) + 1;
+        }
+        broadcast(msg, ws);
+        break;
+
+      // ── Announce public servers on connect / re-announce ──
+      case "announce_servers":
+        (msg.servers || []).forEach((sv) => {
+          if (!publicServers.has(sv.id)) {
+            publicServers.set(sv.id, {
+              id: sv.id,
+              name: sv.name,
+              desc: sv.desc || "",
+              icon: sv.icon || null,
+              color: sv.color || "#6c63ff",
+              memberCount: sv.memberCount || 1,
+              createdAt: sv.createdAt || Date.now(),
+            });
+          }
+        });
+        break;
+
+      case "get_server_list":
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "server_list",
+            servers: [...publicServers.values()],
+          }));
         }
         break;
 
@@ -75,6 +138,17 @@ Deno.serve((req) => {
         }
         break;
       }
+
+      case "dm":
+      case "dm_request":
+      case "dm_accept":
+      case "dm_decline":
+        for (const [client, info] of clients) {
+          if (info.name === msg.to && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(msg));
+          }
+        }
+        break;
 
       default:
         console.log("Unknown message type:", msg.type);
