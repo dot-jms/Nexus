@@ -57,6 +57,8 @@ Deno.serve((req) => {
             color: msg.color || "#6c63ff",
             memberCount: 1,
             createdAt: msg.createdAt || Date.now(),
+            channels: msg.channels || [],
+            ownerId: msg.ownerId || null,
           });
         }
         broadcast(msg, ws);
@@ -79,6 +81,8 @@ Deno.serve((req) => {
             color: msg.color || "#6c63ff",
             memberCount: msg.memberCount || 1,
             createdAt: msg.createdAt || Date.now(),
+            channels: msg.channels || [],
+            ownerId: msg.ownerId || null,
           });
         }
         broadcast(msg, ws);
@@ -110,6 +114,8 @@ Deno.serve((req) => {
               color: sv.color || "#6c63ff",
               memberCount: sv.memberCount || 1,
               createdAt: sv.createdAt || Date.now(),
+              channels: sv.channels || [],
+              ownerId: sv.ownerId || null,
             });
           }
         });
@@ -123,6 +129,14 @@ Deno.serve((req) => {
           }));
         }
         break;
+
+      case "get_server_info": {
+        const sv = publicServers.get(msg.serverId);
+        if (sv && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "server_info", server: sv }));
+        }
+        break;
+      }
 
       case "get_members": {
         const members = [];
