@@ -1,6 +1,8 @@
 // Nexus WebSocket relay server — Deno Deploy
-const clients = new Map(); // ws -> { name, tag, color, pfp }
+const clients = new Map();      // ws -> { name, tag, color, pfp }
 const publicServers = new Map(); // serverId -> server info
+const msgHistory = new Map();    // channelId -> last 100 messages (for catch-up)
+const offline = new Map();       // username -> [queued messages] (DMs + dm_request etc)
 
 function broadcast(data, exclude = null) {
   const msg = JSON.stringify(data);
@@ -9,6 +11,33 @@ function broadcast(data, exclude = null) {
       ws.send(msg);
     }
   }
+}
+
+// Send to a specific user by name — queue if offline
+function sendToUser(name, data, queue = true) {
+  let delivered = false;
+  for (const [ws, info] of clients) {
+    if (info.name === name && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(data));
+      delivered = true;
+    }
+  }
+  if (!delivered && queue) {
+    if (!offline.has(name)) offline.set(name, []);
+    const q = offline.get(name);
+    q.push(data);
+    // Cap queue at 200 messages per user
+    if (q.length > 200) q.splice(0, q.length - 200);
+  }
+  return delivered;
+}
+
+// Store message in channel history (for catch-up on reconnect)
+function storeMessage(channelId, msg) {
+  if (!msgHistory.has(channelId)) msgHistory.set(channelId, []);
+  const hist = msgHistory.get(channelId);
+  hist.push(msg);
+  if (hist.length > 100) hist.splice(0, hist.length - 100);
 }
 
 Deno.serve((req) => {
@@ -25,16 +54,44 @@ Deno.serve((req) => {
     try { msg = JSON.parse(e.data); } catch { return; }
 
     switch (msg.type) {
-      case "identify":
+
+      case "identify": {
         clients.set(ws, {
           name: msg.user,
           tag: msg.tag,
           color: msg.color,
           pfp: msg.pfp || null,
         });
+        // Flush any queued messages for this user
+        const queue = offline.get(msg.user);
+        if (queue && queue.length) {
+          for (const qmsg of queue) {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(qmsg));
+          }
+          offline.delete(msg.user);
+          console.log(`Flushed ${queue.length} queued messages to ${msg.user}`);
+        }
         break;
+      }
 
-      case "message":
+      case "message": {
+        // Store in history for catch-up
+        storeMessage(msg.channelId, msg);
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "get_history": {
+        // Client asks for recent messages in a channel (on join/reconnect)
+        const hist = msgHistory.get(msg.channelId) || [];
+        const since = msg.since || 0;
+        const unseen = hist.filter(m => m.ts > since);
+        if (unseen.length && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "history", channelId: msg.channelId, messages: unseen }));
+        }
+        break;
+      }
+
       case "typing":
       case "delete_message":
       case "reaction":
@@ -43,22 +100,19 @@ Deno.serve((req) => {
       case "kick_member":
       case "role_assign":
       case "profile_update":
+      case "status_update":
+      case "pin_message":
         broadcast(msg, ws);
         break;
 
-      // ── Server lifecycle — update in-memory list ──
+      // ── Server lifecycle ──
       case "server_create":
         if (msg.isPublic !== false) {
           publicServers.set(msg.serverId, {
-            id: msg.serverId,
-            name: msg.name,
-            desc: msg.desc || "",
-            icon: msg.icon || null,
-            color: msg.color || "#6c63ff",
-            memberCount: 1,
-            createdAt: msg.createdAt || Date.now(),
-            channels: msg.channels || [],
-            ownerId: msg.ownerId || null,
+            id: msg.serverId, name: msg.name, desc: msg.desc || "",
+            icon: msg.icon || null, color: msg.color || "#6c63ff",
+            memberCount: 1, createdAt: msg.createdAt || Date.now(),
+            channels: msg.channels || [], ownerId: msg.ownerId || null,
           });
         }
         broadcast(msg, ws);
@@ -67,22 +121,14 @@ Deno.serve((req) => {
       case "server_update":
         if (publicServers.has(msg.serverId)) {
           const sv = publicServers.get(msg.serverId);
-          if (msg.isPublic === false) {
-            publicServers.delete(msg.serverId);
-          } else {
-            publicServers.set(msg.serverId, { ...sv, ...msg });
-          }
+          if (msg.isPublic === false) publicServers.delete(msg.serverId);
+          else publicServers.set(msg.serverId, { ...sv, ...msg });
         } else if (msg.isPublic === true) {
           publicServers.set(msg.serverId, {
-            id: msg.serverId,
-            name: msg.name,
-            desc: msg.desc || "",
-            icon: msg.icon || null,
-            color: msg.color || "#6c63ff",
-            memberCount: msg.memberCount || 1,
-            createdAt: msg.createdAt || Date.now(),
-            channels: msg.channels || [],
-            ownerId: msg.ownerId || null,
+            id: msg.serverId, name: msg.name, desc: msg.desc || "",
+            icon: msg.icon || null, color: msg.color || "#6c63ff",
+            memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(),
+            channels: msg.channels || [], ownerId: msg.ownerId || null,
           });
         }
         broadcast(msg, ws);
@@ -102,20 +148,14 @@ Deno.serve((req) => {
         broadcast(msg, ws);
         break;
 
-      // ── Announce public servers on connect / re-announce ──
       case "announce_servers":
         (msg.servers || []).forEach((sv) => {
           if (!publicServers.has(sv.id)) {
             publicServers.set(sv.id, {
-              id: sv.id,
-              name: sv.name,
-              desc: sv.desc || "",
-              icon: sv.icon || null,
-              color: sv.color || "#6c63ff",
-              memberCount: sv.memberCount || 1,
-              createdAt: sv.createdAt || Date.now(),
-              channels: sv.channels || [],
-              ownerId: sv.ownerId || null,
+              id: sv.id, name: sv.name, desc: sv.desc || "",
+              icon: sv.icon || null, color: sv.color || "#6c63ff",
+              memberCount: sv.memberCount || 1, createdAt: sv.createdAt || Date.now(),
+              channels: sv.channels || [], ownerId: sv.ownerId || null,
             });
           }
         });
@@ -123,10 +163,7 @@ Deno.serve((req) => {
 
       case "get_server_list":
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "server_list",
-            servers: [...publicServers.values()],
-          }));
+          ws.send(JSON.stringify({ type: "server_list", servers: [...publicServers.values()] }));
         }
         break;
 
@@ -140,28 +177,33 @@ Deno.serve((req) => {
 
       case "get_members": {
         const members = [];
-        for (const [, info] of clients) {
-          if (info.name) members.push(info);
-        }
+        for (const [, info] of clients) { if (info.name) members.push(info); }
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "member_list",
-            serverId: msg.serverId,
-            members,
-          }));
+          ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members }));
         }
         break;
       }
 
+      // ── DMs — queue if recipient offline ──
       case "dm":
+        sendToUser(msg.to, msg, true);
+        break;
+
       case "dm_request":
       case "dm_accept":
       case "dm_decline":
-        for (const [client, info] of clients) {
-          if (info.name === msg.to && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(msg));
-          }
-        }
+      case "friend_request":
+      case "friend_accept":
+      case "friend_decline":
+        sendToUser(msg.to, msg, true); // queue these — deliver when online
+        break;
+
+      // ── Shorts & custom emoji — broadcast to all ──
+      case "short_post":
+      case "short_like":
+      case "short_comment":
+      case "custom_emoji_add":
+        broadcast(msg, ws);
         break;
 
       default:
