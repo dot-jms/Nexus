@@ -94,6 +94,7 @@ Deno.serve((req) => {
 
       case "typing":
       case "delete_message":
+      case "edit_message":
       case "reaction":
       case "member_join":
       case "member_leave":
@@ -102,6 +103,7 @@ Deno.serve((req) => {
       case "profile_update":
       case "status_update":
       case "pin_message":
+      case "roles_update":
         broadcast(msg, ws);
         break;
 
