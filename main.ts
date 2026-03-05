@@ -312,24 +312,31 @@ Deno.serve((req) => {
       const pendingReqs: unknown[] = [];
       const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
       for await (const item of reqIter) pendingReqs.push(item.value);
-      // Send back fresh account data so client always has correct role
+      // Send in multiple small frames to avoid Unexpected EOF on large payloads
       if (ws.readyState === WebSocket.OPEN) {
+        // Frame 1: identity only (no images)
         ws.send(JSON.stringify({
           type: "identified",
           user: {
             name: acct?.name || tokenUser,
             tag: acct?.tag || "0000",
             color: acct?.color || "#6c63ff",
-            pfp: acct?.pfp || null,
+            pfp: null, // sent separately below
             systemRole: acct?.systemRole || "user",
             coAdmin: acct?.coAdmin || false,
             bio: acct?.bio || "",
             socials: acct?.socials || {}
           },
-          servers: userServers,
-          friends: friendsList,
-          friendRequests: pendingReqs,
+          servers: userServers, // icons already stripped
         }));
+        // Frame 2: pfp separately (may be large base64)
+        if (acct?.pfp) {
+          ws.send(JSON.stringify({ type: "user_pfp", pfp: acct.pfp }));
+        }
+        // Frame 3: friends (may contain pfp data)
+        if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
+          ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
+        }
       }
       // Flush queued offline messages
       const queue = offline.get(name);
