@@ -14,7 +14,7 @@ if (!puckEntry.value) {
     tag: "0001",
     color: "#6c63ff",
     pfp: null,
-    passwordHash: hashPw("changeme"), // Puck should change this on first login
+    passwordHash: hashPw("changeme"),
     systemRole: "admin",
     coAdmin: false,
     createdAt: Date.now(),
@@ -35,14 +35,14 @@ function genToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + Date.now().toString(36);
 }
 
-// Active sessions: token → username
+// Active sessions: token → lowercase username
 const sessions = new Map<string, string>();
 // clients: ws → { name, tag, color, pfp, token, systemRole, coAdmin }
 const clients = new Map<WebSocket, Record<string, unknown>>();
 const publicServers = new Map<string, Record<string, unknown>>();
 const msgHistory = new Map<string, unknown[]>();
 const offline = new Map<string, unknown[]>();
-// timed bans: username → { until: number, reason: string }
+// timed bans: lowercase username → { until: number, reason: string }
 const timedBans = new Map<string, { until: number; reason: string }>();
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
@@ -77,49 +77,61 @@ function storeMessage(channelId: string, msg: unknown) {
   if (hist.length > 100) hist.splice(0, hist.length - 100);
 }
 
-// Verify token → returns username or null
-// Checks in-memory sessions first (fast), then falls back to KV sessions
+// Verify token → returns lowercase username or null
 async function verifyTokenKv(token: string | undefined): Promise<string | null> {
   if (!token) return null;
   const mem = sessions.get(token);
   if (mem) return mem;
-  // KV fallback (survives restarts)
   const entry = await kv.get<string>(["sessions", token]);
   if (entry.value) {
-    sessions.set(token, entry.value); // warm the memory cache
+    sessions.set(token, entry.value);
     return entry.value;
   }
   return null;
 }
-function verifyToken(token: string | undefined): string | null {
-  if (!token) return null;
-  return sessions.get(token) || null;
-}
 
-// Get client info from ws
 function clientInfo(ws: WebSocket): Record<string, unknown> | null {
   return clients.get(ws) || null;
 }
 
-// Check if a username is banned right now
 function isBanned(username: string): boolean {
   const ban = timedBans.get(username.toLowerCase());
   if (!ban) return false;
-  if (ban.until === -1) return true; // permanent
+  if (ban.until === -1) return true;
   if (Date.now() < ban.until) return true;
-  timedBans.delete(username.toLowerCase()); // expired
+  timedBans.delete(username.toLowerCase());
   return false;
+}
+
+// ─── FIX: Helper to add a server to a user's membership index ───────────────
+// Always uses lowercase username as the KV key to avoid case mismatches.
+async function addServerToUser(username: string, serverId: string) {
+  const key = ["user_servers", username.toLowerCase()];
+  const entry = await kv.get<string[]>(key);
+  const list = entry.value || [];
+  if (!list.includes(serverId)) {
+    list.push(serverId);
+    await kv.set(key, list);
+    console.log(`[membership] added server ${serverId} to user ${username.toLowerCase()} (now has ${list.length})`);
+  }
+}
+
+async function removeServerFromUser(username: string, serverId: string) {
+  const key = ["user_servers", username.toLowerCase()];
+  const entry = await kv.get<string[]>(key);
+  if (entry.value) {
+    await kv.set(key, entry.value.filter((id: string) => id !== serverId));
+  }
 }
 
 // ─── Load persisted servers into memory on startup ──────────────────────────
 {
-  const svIter = kv.list<Record<string,unknown>>({ prefix: ["servers"] });
+  const svIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
   for await (const item of svIter) {
     const sv = item.value;
     if (sv && sv.isPublic !== false) publicServers.set(sv.id as string, sv);
   }
   console.log(`Loaded ${publicServers.size} servers from KV`);
-  // Warm in-memory msgHistory from KV for fast access
   const chIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
   for await (const item of chIter) {
     const chId = item.key[1] as string;
@@ -174,7 +186,7 @@ Deno.serve((req) => {
       await kv.set(key, acct);
       const token = genToken();
       sessions.set(token, username.toLowerCase());
-      await kv.set(["sessions", token], username.toLowerCase()); // persist across restarts
+      await kv.set(["sessions", token], username.toLowerCase());
       console.log(`Registered: ${username}`);
       ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: false } }));
       return;
@@ -192,7 +204,6 @@ Deno.serve((req) => {
       if (acct.passwordHash !== hashPw(password)) {
         ws.send(JSON.stringify({ type: "auth_error", message: "Incorrect password." })); return;
       }
-      // Check ban
       if (isBanned(username)) {
         const ban = timedBans.get(username);
         const until = ban?.until === -1 ? "permanently" : `until ${new Date(ban!.until).toLocaleString()}`;
@@ -200,7 +211,7 @@ Deno.serve((req) => {
       }
       const token = genToken();
       sessions.set(token, username);
-      await kv.set(["sessions", token], username); // persist across restarts
+      await kv.set(["sessions", token], username);
       console.log(`Login: ${acct.name}`);
       const firstLogin = !acct.hasLoggedIn;
       if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true });
@@ -208,8 +219,6 @@ Deno.serve((req) => {
       return;
     }
 
-
-    // ── check_username — before registering ──────────────────────────────
     if (msg.type === "check_username") {
       const username = (msg.username as string || "").trim().toLowerCase();
       const entry = await kv.get(["accounts", username]);
@@ -217,7 +226,6 @@ Deno.serve((req) => {
       return;
     }
 
-    // ── MIGRATION — claim existing localStorage account on the server ─────
     if (msg.type === "auth_migrate") {
       const username = (msg.username as string || "").trim();
       const password = msg.password as string || "";
@@ -230,18 +238,13 @@ Deno.serve((req) => {
       const key = ["accounts", username.toLowerCase()];
       const existing = await kv.get(key);
       if (existing.value) {
-        // Username taken — offer to login instead
         ws.send(JSON.stringify({ type: "auth_error", message: "That username is already registered. Try logging in, or choose a different username." })); return;
       }
-      const acct = {
-        name: username, tag, color, pfp,
-        passwordHash: hashPw(password),
-        systemRole: "user", coAdmin: false,
-        createdAt: Date.now(),
-      };
+      const acct = { name: username, tag, color, pfp, passwordHash: hashPw(password), systemRole: "user", coAdmin: false, createdAt: Date.now() };
       await kv.set(key, acct);
       const token = genToken();
       sessions.set(token, username.toLowerCase());
+      await kv.set(["sessions", token], username.toLowerCase());
       ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: "user", coAdmin: false }, migrated: true }));
       return;
     }
@@ -253,104 +256,7 @@ Deno.serve((req) => {
       return;
     }
 
-    // ── identify — register this WS with the verified username ───────────
-    if (msg.type === "identify") {
-      const key = ["accounts", tokenUser];
-      // Register client synchronously first so subsequent messages aren't dropped
-      // while we do async KV lookups below
-      const earlyName = tokenUser;
-      if (!clients.has(ws)) {
-        clients.set(ws, {
-          name: earlyName,
-          tag: "0000",
-          color: msg.color || "#6c63ff",
-          pfp: msg.pfp || null,
-          token: msg.token,
-          systemRole: "user",
-          coAdmin: false,
-        });
-      }
-      const entry = await kv.get<Record<string, unknown>>(key);
-      const acct = entry.value;
-      const name = acct?.name as string || tokenUser;
-      // Update with real account data now that we have it
-      clients.set(ws, {
-        name,
-        tag: acct?.tag || "0000",
-        color: msg.color || acct?.color || "#6c63ff",
-        pfp: msg.pfp || acct?.pfp || null,
-        token: msg.token,
-        systemRole: acct?.systemRole || "user",
-        coAdmin: acct?.coAdmin || false,
-      });
-      // Collect servers this user is a member of — use user-indexed key for reliability
-      const userServers: Record<string, unknown>[] = [];
-      const userSvIdsEntry = await kv.get<string[]>(["user_servers", name]);
-      console.log(`[identify] user=${name} user_servers_key=${JSON.stringify(userSvIdsEntry.value)}`);
-      const userSvIds = userSvIdsEntry.value || [];
-      for (const svId of userSvIds) {
-        const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
-        console.log(`[identify] svId=${svId} found=${!!svEntry.value} isPublic=${svEntry.value?.isPublic}`);
-        if (svEntry.value) {
-          const sv = svEntry.value;
-          // Strip base64 icon to keep frame small — client fetches full info separately
-          userServers.push({
-            id: sv.id, name: sv.name, desc: sv.desc || "",
-            color: sv.color || "#6c63ff",
-            icon: null,
-            channels: sv.channels || [],
-            ownerId: sv.ownerId,
-            memberCount: sv.memberCount || 1,
-            createdAt: sv.createdAt || 0,
-            isPublic: sv.isPublic !== false,
-          });
-        }
-      }
-      console.log(`[identify] sending ${userServers.length} servers to ${name}`);
-      // Also collect KV friends/requests
-      const friendsList = (await kv.get(["friends", tokenUser])).value || [];
-      const pendingReqs: unknown[] = [];
-      const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
-      for await (const item of reqIter) pendingReqs.push(item.value);
-      // Send in multiple small frames to avoid Unexpected EOF on large payloads
-      if (ws.readyState === WebSocket.OPEN) {
-        // Frame 1: identity only (no images)
-        ws.send(JSON.stringify({
-          type: "identified",
-          user: {
-            name: acct?.name || tokenUser,
-            tag: acct?.tag || "0000",
-            color: acct?.color || "#6c63ff",
-            pfp: null, // sent separately below
-            systemRole: acct?.systemRole || "user",
-            coAdmin: acct?.coAdmin || false,
-            bio: acct?.bio || "",
-            socials: acct?.socials || {}
-          },
-          servers: userServers, // icons already stripped
-        }));
-        // Frame 2: pfp separately (may be large base64)
-        if (acct?.pfp) {
-          ws.send(JSON.stringify({ type: "user_pfp", pfp: acct.pfp }));
-        }
-        // Frame 3: friends (may contain pfp data)
-        if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
-          ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
-        }
-      }
-      // Flush queued offline messages
-      const queue = offline.get(name);
-      if (queue?.length) {
-        for (const qmsg of queue) {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(qmsg));
-        }
-        offline.delete(name);
-      }
-      return;
-    }
-
-    // ── Guard: must be identified ─────────────────────────────────────────
-    // auth_change_password is allowed before full identify (token is enough)
+    // ── auth_change_password — allowed before full identify ───────────────
     if (msg.type === "auth_change_password") {
       const oldPassword = msg.oldPassword as string || "";
       const newPassword = msg.newPassword as string || "";
@@ -368,8 +274,108 @@ Deno.serve((req) => {
       return;
     }
 
+    // ── identify ──────────────────────────────────────────────────────────
+    if (msg.type === "identify") {
+      const key = ["accounts", tokenUser];
+      // Register client immediately (synchronously) so subsequent messages aren't
+      // dropped by the !info guard while we await KV reads below.
+      // FIX: use tokenUser (lowercase) as a stable early name; will be updated below.
+      clients.set(ws, {
+        name: tokenUser, // temporary — overwritten after KV lookup
+        tag: "0000",
+        color: msg.color || "#6c63ff",
+        pfp: msg.pfp || null,
+        token: msg.token,
+        systemRole: "user",
+        coAdmin: false,
+      });
+
+      const entry = await kv.get<Record<string, unknown>>(key);
+      const acct = entry.value;
+      const name = acct?.name as string || tokenUser;
+
+      // Update with real account data
+      clients.set(ws, {
+        name,
+        tag: acct?.tag || "0000",
+        color: msg.color || acct?.color || "#6c63ff",
+        pfp: msg.pfp || acct?.pfp || null,
+        token: msg.token,
+        systemRole: acct?.systemRole || "user",
+        coAdmin: acct?.coAdmin || false,
+      });
+
+      // FIX: Look up user_servers by lowercased token user (consistent key)
+      const userSvsKey = ["user_servers", tokenUser]; // tokenUser is already lowercase
+      const userSvIdsEntry = await kv.get<string[]>(userSvsKey);
+      console.log(`[identify] user=${name} (key=${tokenUser}) user_servers=${JSON.stringify(userSvIdsEntry.value)}`);
+      const userSvIds = userSvIdsEntry.value || [];
+
+      const userServers: Record<string, unknown>[] = [];
+      for (const svId of userSvIds) {
+        const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+        console.log(`[identify] svId=${svId} found=${!!svEntry.value}`);
+        if (svEntry.value) {
+          const sv = svEntry.value;
+          userServers.push({
+            id: sv.id, name: sv.name, desc: sv.desc || "",
+            color: sv.color || "#6c63ff",
+            icon: null, // sent separately via get_server_info
+            channels: sv.channels || [],
+            ownerId: sv.ownerId,
+            memberCount: sv.memberCount || 1,
+            createdAt: sv.createdAt || 0,
+            isPublic: sv.isPublic !== false,
+          });
+        }
+      }
+      console.log(`[identify] sending ${userServers.length} servers to ${name}`);
+
+      const friendsList = (await kv.get(["friends", tokenUser])).value || [];
+      const pendingReqs: unknown[] = [];
+      const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
+      for await (const item of reqIter) pendingReqs.push(item.value);
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "identified",
+          user: {
+            name: acct?.name || tokenUser,
+            tag: acct?.tag || "0000",
+            color: acct?.color || "#6c63ff",
+            pfp: null,
+            systemRole: acct?.systemRole || "user",
+            coAdmin: acct?.coAdmin || false,
+            bio: acct?.bio || "",
+            socials: acct?.socials || {}
+          },
+          servers: userServers,
+        }));
+        if (acct?.pfp) {
+          ws.send(JSON.stringify({ type: "user_pfp", pfp: acct.pfp }));
+        }
+        if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
+          ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
+        }
+      }
+
+      // Flush queued offline messages
+      const queue = offline.get(name);
+      if (queue?.length) {
+        for (const qmsg of queue) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(qmsg));
+        }
+        offline.delete(name);
+      }
+      return;
+    }
+
+    // ── Guard: must be identified ─────────────────────────────────────────
+    // FIX: Because we now register the client synchronously at the start of
+    // identify (before awaiting KV), this guard will no longer drop messages
+    // that arrive before identify's async work finishes.
     if (!info) {
-      // Client has a valid token but hasn't sent identify yet — ignore
+      // Client has a valid token but hasn't sent identify yet
       return;
     }
 
@@ -382,34 +388,29 @@ Deno.serve((req) => {
     if (msg.type === "appoint_coadmin") {
       if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can appoint co-admins." })); return; }
       const target = (msg.target as string || "").toLowerCase();
-      const appoint = msg.appoint === true;
       const targetKey = ["accounts", target];
       const targetEntry = await kv.get<Record<string, unknown>>(targetKey);
       if (!targetEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); return; }
-      await kv.set(targetKey, { ...targetEntry.value, coAdmin: appoint });
-      // Update live client if connected
+      await kv.set(targetKey, { ...targetEntry.value, coAdmin: msg.appoint === true });
       for (const [cws, ci] of clients) {
         if ((ci.name as string).toLowerCase() === target) {
-          (ci as Record<string, unknown>).coAdmin = appoint;
-          cws.send(JSON.stringify({ type: "system_role_update", coAdmin: appoint, message: appoint ? "You have been appointed as Co-Admin by Puck!" : "Your Co-Admin status has been removed." }));
+          (ci as Record<string, unknown>).coAdmin = msg.appoint === true;
+          cws.send(JSON.stringify({ type: "system_role_update", coAdmin: msg.appoint === true, message: msg.appoint ? "You have been appointed as Co-Admin by Puck!" : "Your Co-Admin status has been removed." }));
         }
       }
-      broadcast({ type: "coadmin_update", target: targetEntry.value.name, coAdmin: appoint }, ws);
-      ws.send(JSON.stringify({ type: "success", message: `${targetEntry.value.name} is now ${appoint ? "a Co-Admin" : "a regular user"}.` }));
+      broadcast({ type: "coadmin_update", target: targetEntry.value.name, coAdmin: msg.appoint === true }, ws);
+      ws.send(JSON.stringify({ type: "success", message: `${targetEntry.value.name} is now ${msg.appoint ? "a Co-Admin" : "a regular user"}.` }));
       return;
     }
 
-    // ── Admin/CoAdmin: timed ban ──────────────────────────────────────────
     if (msg.type === "admin_ban") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
       const target = (msg.target as string || "").toLowerCase();
       const targetEntry = await kv.get<Record<string, unknown>>(["accounts", target]);
       if (!targetEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); return; }
-      // Co-admins can't ban each other
       if (!isAdmin && (targetEntry.value.coAdmin || targetEntry.value.systemRole === "admin")) {
         ws.send(JSON.stringify({ type: "error", message: "Co-admins cannot ban each other or Puck." })); return;
       }
-      // Parse duration: "1h", "2d", "permanent"
       const dur = (msg.duration as string || "").toLowerCase();
       let until: number;
       if (dur === "permanent" || dur === "perm") {
@@ -422,7 +423,6 @@ Deno.serve((req) => {
         until = Date.now() + ms;
       }
       timedBans.set(target, { until, reason: msg.reason as string || "No reason given" });
-      // Kick them off if connected
       for (const [cws, ci] of clients) {
         if ((ci.name as string).toLowerCase() === target) {
           cws.send(JSON.stringify({ type: "banned", until, reason: msg.reason || "No reason given" }));
@@ -437,19 +437,16 @@ Deno.serve((req) => {
 
     if (msg.type === "admin_unban") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
-      const target = (msg.target as string || "").toLowerCase();
-      timedBans.delete(target);
+      timedBans.delete((msg.target as string || "").toLowerCase());
       ws.send(JSON.stringify({ type: "success", message: `${msg.target} unbanned.` }));
       return;
     }
 
-    // ── Admin: view DMs — reads directly from KV, no need for target to be online ──
     if (msg.type === "admin_view_dms") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
       const targetUser = (msg.target as string || "").trim().toLowerCase();
       if (!targetUser) { ws.send(JSON.stringify({ type: "error", message: "Specify a username." })); return; }
-      const prefix = ["dm_history"];
-      const iter = kv.list<unknown[]>({ prefix });
+      const iter = kv.list<unknown[]>({ prefix: ["dm_history"] });
       const convos: { name: string; messages: unknown[] }[] = [];
       for await (const item of iter) {
         const key = item.key[1] as string;
@@ -463,44 +460,39 @@ Deno.serve((req) => {
       return;
     }
 
-    // ── Admin: delete any server ──────────────────────────────────────────
     if (msg.type === "admin_delete_server") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
       publicServers.delete(msg.serverId as string);
+      await kv.delete(["servers", msg.serverId as string]);
       broadcast({ type: "server_delete", serverId: msg.serverId, by: senderName });
       ws.send(JSON.stringify({ type: "success", message: "Server deleted." }));
       return;
     }
 
-    // ── Profile update — also update KV ──────────────────────────────────
     if (msg.type === "profile_update") {
       const key = ["accounts", senderName.toLowerCase()];
       const entry = await kv.get<Record<string, unknown>>(key);
       if (entry.value) {
-        await kv.set(key, { ...entry.value, color: msg.color || entry.value.color, pfp: msg.pfp !== undefined ? msg.pfp : entry.value.pfp });
+        await kv.set(key, { ...entry.value, color: msg.color || entry.value.color, pfp: msg.pfp !== undefined ? msg.pfp : entry.value.pfp, bio: msg.bio ?? entry.value.bio, socials: msg.socials ?? entry.value.socials });
       }
-      // Update in-memory client info
       if (info) { (info as Record<string, unknown>).color = msg.color; (info as Record<string, unknown>).pfp = msg.pfp; }
       broadcast(msg, ws);
       return;
     }
 
-    // ── All other messages — verify sender matches token ─────────────────
-    // Prevent impersonation: override msg.author with verified name
+    // Prevent impersonation
     if (msg.author !== undefined) msg.author = senderName;
     if (msg.user !== undefined && msg.type !== "admin_ban" && msg.type !== "admin_unban") msg.user = senderName;
     if (msg.from !== undefined) msg.from = senderName;
 
     switch (msg.type) {
       case "message": {
-        // Persist to KV for new joiners to see history
         const chKey = ["ch_history", msg.channelId as string];
         const chEntry = await kv.get<unknown[]>(chKey);
         const chHist = chEntry.value || [];
         chHist.push(msg);
         if (chHist.length > 500) chHist.splice(0, chHist.length - 500);
         await kv.set(chKey, chHist);
-        // Also keep in-memory for fast retrieval
         storeMessage(msg.channelId as string, msg);
         broadcast(msg, ws);
         break;
@@ -545,17 +537,14 @@ Deno.serve((req) => {
         break;
       }
 
-      // ── Voice calls (P2P, routed to specific user) ──
       case "vcall_invite":
       case "vcall_accept":
       case "vcall_decline":
       case "vcall_signal": {
-        const target = msg.to as string;
-        sendToUser(target, msg, true);
+        sendToUser(msg.to as string, msg, true);
         break;
       }
       case "vcall_end": {
-        // Broadcast end to all participants
         broadcast(msg, ws);
         break;
       }
@@ -569,50 +558,37 @@ Deno.serve((req) => {
           isPublic: msg.isPublic !== false,
         };
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
-        // Persist to KV so servers survive cache wipes
         await kv.set(["servers", msg.serverId as string], svData);
-        console.log(`[server_create] saved server id=${msg.serverId} name=${msg.name} isPublic=${svData.isPublic}`);
-        // Track membership — both direction indexes
+        console.log(`[server_create] saved id=${msg.serverId} name=${msg.name} owner=${senderName}`);
+
+        // FIX: Use the addServerToUser helper which always lowercases the key
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
-        {
-          const userSvsEntry = await kv.get<string[]>(["user_servers", senderName]);
-          const userSvs = userSvsEntry.value || [];
-          if (!userSvs.includes(msg.serverId as string)) {
-            userSvs.push(msg.serverId as string);
-            await kv.set(["user_servers", senderName], userSvs);
-          }
-          console.log(`[server_create] user_servers for ${senderName}: ${JSON.stringify(userSvs)}`);
-        }
+        await addServerToUser(senderName, msg.serverId as string);
+
         broadcast(msg, ws);
         break;
       }
 
       case "server_update": {
         const sid = msg.serverId as string;
-        console.log(`[server_update] sid=${sid} isPublic=${msg.isPublic} name=${msg.name} from=${senderName}`);
         const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
-        console.log(`[server_update] existing in KV: ${!!existing.value} inMemory: ${publicServers.has(sid)}`);
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
           if (msg.isPublic === false) {
             publicServers.delete(sid);
-            // Still persist the server to KV but as private
-            const updated = { ...sv, ...msg, isPublic: false };
-            await kv.set(["servers", sid], updated);
+            await kv.set(["servers", sid], { ...sv, ...msg, isPublic: false });
           } else {
             const updated = { ...sv, ...msg };
             publicServers.set(sid, updated);
             await kv.set(["servers", sid], updated);
           }
         } else if (msg.isPublic === true) {
-          // Private server becoming public — pull full data from KV if available
           const base = existing.value || {};
           const updated = { ...base, id: sid, name: msg.name, desc: msg.desc || "", icon: msg.icon || null, color: msg.color || "#6c63ff", memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(), channels: msg.channels || [], ownerId: msg.ownerId || senderName, isPublic: true };
           publicServers.set(sid, updated);
           await kv.set(["servers", sid], updated);
         } else if (existing.value) {
-          const updated = { ...existing.value, ...msg };
-          await kv.set(["servers", sid], updated);
+          await kv.set(["servers", sid], { ...existing.value, ...msg });
         }
         broadcast(msg, ws);
         break;
@@ -620,31 +596,25 @@ Deno.serve((req) => {
 
       case "server_delete": {
         const delSvId = msg.serverId as string;
-        const delSvEntry = await kv.get<Record<string,unknown>>(["servers", delSvId]);
+        const delSvEntry = await kv.get<Record<string, unknown>>(["servers", delSvId]);
         publicServers.delete(delSvId);
         await kv.delete(["servers", delSvId]);
-        // Delete all channel history
-        const delChannels = (delSvEntry.value?.channels as Array<{id:string}>) || [];
-        for (const ch of delChannels) { await kv.delete(["ch_history", ch.id]); }
-        // Delete memberships and remove from user_servers indexes
+        const delChannels = (delSvEntry.value?.channels as Array<{ id: string }>) || [];
+        for (const ch of delChannels) await kv.delete(["ch_history", ch.id]);
+        // Remove from all member indexes
         const delMemIter = kv.list({ prefix: ["server_member", delSvId] });
         for await (const item of delMemIter) {
           const memberName = item.key[2] as string;
           await kv.delete(item.key);
-          const usvEntry = await kv.get<string[]>(["user_servers", memberName]);
-          if (usvEntry.value) {
-            await kv.set(["user_servers", memberName], usvEntry.value.filter((id: string) => id !== delSvId));
-          }
+          await removeServerFromUser(memberName, delSvId);
         }
         broadcast(msg, ws);
         break;
       }
+
       case "leave_server": {
         await kv.delete(["server_member", msg.serverId as string, senderName]);
-        const userSvsL = await kv.get<string[]>(["user_servers", senderName]);
-        if (userSvsL.value) {
-          await kv.set(["user_servers", senderName], userSvsL.value.filter((id: string) => id !== msg.serverId));
-        }
+        await removeServerFromUser(senderName, msg.serverId as string);
         broadcast(msg, ws);
         break;
       }
@@ -652,22 +622,14 @@ Deno.serve((req) => {
       case "join_server": {
         const sv = publicServers.get(msg.serverId as string);
         if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", msg.serverId as string], sv); }
-        // Track membership so we can show offline members
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
-        {
-          const userSvsJ = await kv.get<string[]>(["user_servers", senderName]);
-          const userSvsJList = userSvsJ.value || [];
-          if (!userSvsJList.includes(msg.serverId as string)) {
-            userSvsJList.push(msg.serverId as string);
-            await kv.set(["user_servers", senderName], userSvsJList);
-          }
-        }
+        // FIX: Use helper to ensure consistent lowercase key
+        await addServerToUser(senderName, msg.serverId as string);
         broadcast(msg, ws);
         break;
       }
 
       case "announce_servers":
-        // Upsert into both in-memory map and KV
         for (const sv of (msg.servers as unknown[] || [])) {
           const s = sv as Record<string, unknown>;
           if (!s.id) continue;
@@ -688,30 +650,17 @@ Deno.serve((req) => {
         for await (const item of svListIter) {
           const sv = item.value;
           if (sv && sv.isPublic !== false) {
-            // Strip icon to keep payload small
-            svList.push({
-              id: sv.id, name: sv.name, desc: sv.desc || "",
-              color: sv.color || "#6c63ff", icon: null,
-              memberCount: sv.memberCount || 1,
-              createdAt: sv.createdAt || 0,
-              channels: sv.channels || [],
-              ownerId: sv.ownerId, isPublic: true,
-            });
+            svList.push({ id: sv.id, name: sv.name, desc: sv.desc || "", color: sv.color || "#6c63ff", icon: null, memberCount: sv.memberCount || 1, createdAt: sv.createdAt || 0, channels: sv.channels || [], ownerId: sv.ownerId, isPublic: true });
           }
         }
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "server_list", servers: svList }));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "server_list", servers: svList }));
         break;
       }
 
       case "get_server_info": {
-        // Try KV first for authoritative data
         const svInfoEntry = await kv.get<Record<string, unknown>>(["servers", msg.serverId as string]);
         const svInfo = svInfoEntry.value || publicServers.get(msg.serverId as string);
-        if (svInfo && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "server_info", server: svInfo }));
-        }
+        if (svInfo && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "server_info", server: svInfo }));
         break;
       }
 
@@ -719,9 +668,7 @@ Deno.serve((req) => {
         const withUser = msg.with as string;
         const dmKey = ["dm_history", [senderName, withUser].sort().join(":")];
         const entry = await kv.get<unknown[]>(dmKey);
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "dm_history", with: withUser, messages: entry.value || [] }));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "dm_history", with: withUser, messages: entry.value || [] }));
         break;
       }
 
@@ -734,35 +681,28 @@ Deno.serve((req) => {
             onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
           }
         }
-        // Also include offline members who have joined this server
         const svId = msg.serverId as string;
         const memIter2 = kv.list({ prefix: ["server_member", svId] });
         const offlineMembers = [];
         for await (const item of memIter2) {
           const mName = item.key[2] as string;
           if (!onlineNames.has(mName)) {
-            const mAcct = await kv.get<Record<string,unknown>>(["accounts", mName.toLowerCase()]);
-            if (mAcct.value) {
-              offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
-            }
+            const mAcct = await kv.get<Record<string, unknown>>(["accounts", mName.toLowerCase()]);
+            if (mAcct.value) offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
           }
         }
-        const allMembers = [...onlineMembers, ...offlineMembers];
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: allMembers }));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: [...onlineMembers, ...offlineMembers] }));
         break;
       }
 
       case "dm": {
         const dmTo = msg.to as string;
         const dmFrom = msg.from as string;
-        // Persist to KV so messages survive relay restarts
         const dmKey = ["dm_history", [dmFrom, dmTo].sort().join(":")];
         const existing = await kv.get<unknown[]>(dmKey);
         const hist = existing.value || [];
         hist.push({ ...msg, _stored: Date.now() });
-        if (hist.length > 500) hist.splice(0, hist.length - 500); // keep last 500
+        if (hist.length > 500) hist.splice(0, hist.length - 500);
         await kv.set(dmKey, hist);
         sendToUser(dmTo, msg, true);
         break;
@@ -784,14 +724,11 @@ Deno.serve((req) => {
         broadcast(msg, ws);
         break;
 
-      // Admin: receive DM data from target user
       case "admin_dm_response": {
-        const requester = msg.requestedBy as string;
-        sendToUser(requester, { type: "admin_dm_data", target: senderName, dms: msg.dms }, false);
+        sendToUser(msg.requestedBy as string, { type: "admin_dm_data", target: senderName, dms: msg.dms }, false);
         break;
       }
 
-      // Admin-only: rename any user
       case "admin_rename_user": {
         if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can rename users." })); break; }
         const target = (msg.target as string || "").trim();
@@ -803,12 +740,10 @@ Deno.serve((req) => {
         const targetEntry = await kv.get<Record<string, unknown>>(targetKey);
         if (!targetEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
         const newKey = ["accounts", newName.toLowerCase()];
-        const existing = await kv.get(newKey);
-        if (existing.value) { ws.send(JSON.stringify({ type: "error", message: "That username is already taken." })); break; }
-        // Copy account to new key, delete old
+        const existingNew = await kv.get(newKey);
+        if (existingNew.value) { ws.send(JSON.stringify({ type: "error", message: "That username is already taken." })); break; }
         await kv.set(newKey, { ...targetEntry.value as object, name: newName });
         await kv.delete(targetKey);
-        // Update live client if connected
         for (const [cws, ci] of clients) {
           if ((ci.name as string).toLowerCase() === target.toLowerCase()) {
             (ci as Record<string, unknown>).name = newName;
@@ -820,7 +755,6 @@ Deno.serve((req) => {
         break;
       }
 
-      // Admin-only: set any user's profile picture
       case "admin_set_pfp": {
         if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can change profile pictures." })); break; }
         const pfpTarget = (msg.target as string || "").trim().toLowerCase();
@@ -829,19 +763,14 @@ Deno.serve((req) => {
         const pfpEntry = await kv.get<Record<string, unknown>>(pfpKey);
         if (!pfpEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
         await kv.set(pfpKey, { ...pfpEntry.value as object, pfp: pfpData });
-        // Update live client
-        for (const [cws, ci] of clients) {
-          if ((ci.name as string).toLowerCase() === pfpTarget) {
-            (ci as Record<string, unknown>).pfp = pfpData;
-          }
+        for (const [, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === pfpTarget) (ci as Record<string, unknown>).pfp = pfpData;
         }
-        // Broadcast profile update so everyone sees the new pfp
         broadcast({ type: "profile_update", user: pfpEntry.value.name, pfp: pfpData, color: pfpEntry.value.color }, null);
         ws.send(JSON.stringify({ type: "success", message: `PFP updated for ${pfpEntry.value.name}.` }));
         break;
       }
 
-      // Admin-only: broadcast platform alert to all connected users
       case "platform_alert": {
         if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send platform alerts." })); break; }
         const alertTitle = (msg.title as string || "").slice(0, 80);
