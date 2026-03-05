@@ -1,4 +1,4 @@
-// Nexus WebSocket relay — Deno Deploy 
+// Nexus WebSocket relay — Deno Deploy
 // Server-side auth via Deno KV. Accounts persist across restarts.
 // Puck is the platform admin. Co-admins can be appointed by Puck.
 
