@@ -552,16 +552,13 @@ Deno.serve((req) => {
       case "server_create": {
         const svData = {
           id: msg.serverId, name: msg.name, desc: msg.desc || "",
-          icon: null, // never store base64 in main record (KV 64KB limit)
-          color: msg.color || "#6c63ff",
+          icon: msg.icon || null, color: msg.color || "#6c63ff",
           memberCount: 1, createdAt: msg.createdAt || Date.now(),
           channels: msg.channels || [], ownerId: senderName,
           isPublic: msg.isPublic !== false,
         };
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
         await kv.set(["servers", msg.serverId as string], svData);
-        // Store icon separately (may be large base64 — kept out of main record)
-        if (msg.icon) await kv.set(["server_icon", msg.serverId as string], msg.icon);
         console.log(`[server_create] saved id=${msg.serverId} name=${msg.name} owner=${senderName}`);
 
         // FIX: Use the addServerToUser helper which always lowercases the key
@@ -569,6 +566,10 @@ Deno.serve((req) => {
         await addServerToUser(senderName, msg.serverId as string);
 
         broadcast(msg, ws);
+        // ACK back to creator so client knows it was persisted to KV
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "server_create_ok", serverId: msg.serverId }));
+        }
         break;
       }
 
@@ -581,8 +582,7 @@ Deno.serve((req) => {
             publicServers.delete(sid);
             await kv.set(["servers", sid], { ...sv, ...msg, isPublic: false });
           } else {
-            const updated = { ...sv, ...msg, icon: null };
-            if (msg.icon) await kv.set(["server_icon", sid], msg.icon);
+            const updated = { ...sv, ...msg };
             publicServers.set(sid, updated);
             await kv.set(["servers", sid], updated);
           }
@@ -663,13 +663,8 @@ Deno.serve((req) => {
 
       case "get_server_info": {
         const svInfoEntry = await kv.get<Record<string, unknown>>(["servers", msg.serverId as string]);
-        const svInfo = svInfoEntry.value ? {...svInfoEntry.value} : (publicServers.get(msg.serverId as string) ? {...publicServers.get(msg.serverId as string)!} : null);
-        if (svInfo) {
-          // Merge icon back in from separate KV key
-          const iconEntry = await kv.get(["server_icon", msg.serverId as string]);
-          if (iconEntry.value) svInfo.icon = iconEntry.value;
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "server_info", server: svInfo }));
-        }
+        const svInfo = svInfoEntry.value || publicServers.get(msg.serverId as string);
+        if (svInfo && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "server_info", server: svInfo }));
         break;
       }
 
