@@ -1,6 +1,9 @@
 // Nexus WebSocket relay server — Deno Deploy
+// NOTE: Accounts are stored in each user's browser localStorage — NOT on this server.
+// Restarting/redeploying this relay NEVER deletes accounts.
+// Servers and message history are re-announced by clients on reconnect.
 const clients = new Map();      // ws -> { name, tag, color, pfp }
-const publicServers = new Map(); // serverId -> server info
+const publicServers = new Map(); // serverId -> server info (rebuilt from client announces)
 const msgHistory = new Map();    // channelId -> last 100 messages (for catch-up)
 const offline = new Map();       // username -> [queued messages] (DMs + dm_request etc)
 
@@ -104,8 +107,23 @@ Deno.serve((req) => {
       case "status_update":
       case "pin_message":
       case "roles_update":
+      case "channel_delete":
+      case "voice_join":
+      case "voice_leave":
         broadcast(msg, ws);
         break;
+      // Voice signals — route to specific target
+      case "voice_signal": {
+        const target = msg.to;
+        let routed = false;
+        for (const [tws, info] of clients) {
+          if (info.name === target && tws.readyState === WebSocket.OPEN) {
+            tws.send(JSON.stringify(msg));
+            routed = true;
+          }
+        }
+        break;
+      }
 
       // ── Server lifecycle ──
       case "server_create":
