@@ -546,10 +546,20 @@ Deno.serve((req) => {
         const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
-          if (msg.isPublic === false) { publicServers.delete(sid); }
-          else { const updated = { ...sv, ...msg }; publicServers.set(sid, updated); await kv.set(["servers", sid], updated); }
+          if (msg.isPublic === false) {
+            publicServers.delete(sid);
+            // Still persist the server to KV but as private
+            const updated = { ...sv, ...msg, isPublic: false };
+            await kv.set(["servers", sid], updated);
+          } else {
+            const updated = { ...sv, ...msg };
+            publicServers.set(sid, updated);
+            await kv.set(["servers", sid], updated);
+          }
         } else if (msg.isPublic === true) {
-          const updated = { id: sid, name: msg.name, desc: msg.desc || "", icon: msg.icon || null, color: msg.color || "#6c63ff", memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(), channels: msg.channels || [], ownerId: msg.ownerId || senderName, isPublic: true };
+          // Private server becoming public — pull full data from KV if available
+          const base = existing.value || {};
+          const updated = { ...base, id: sid, name: msg.name, desc: msg.desc || "", icon: msg.icon || null, color: msg.color || "#6c63ff", memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(), channels: msg.channels || [], ownerId: msg.ownerId || senderName, isPublic: true };
           publicServers.set(sid, updated);
           await kv.set(["servers", sid], updated);
         } else if (existing.value) {
