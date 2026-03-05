@@ -78,6 +78,19 @@ function storeMessage(channelId: string, msg: unknown) {
 }
 
 // Verify token → returns username or null
+// Checks in-memory sessions first (fast), then falls back to KV sessions
+async function verifyTokenKv(token: string | undefined): Promise<string | null> {
+  if (!token) return null;
+  const mem = sessions.get(token);
+  if (mem) return mem;
+  // KV fallback (survives restarts)
+  const entry = await kv.get<string>(["sessions", token]);
+  if (entry.value) {
+    sessions.set(token, entry.value); // warm the memory cache
+    return entry.value;
+  }
+  return null;
+}
 function verifyToken(token: string | undefined): string | null {
   if (!token) return null;
   return sessions.get(token) || null;
@@ -145,6 +158,7 @@ Deno.serve((req) => {
       await kv.set(key, acct);
       const token = genToken();
       sessions.set(token, username.toLowerCase());
+      await kv.set(["sessions", token], username.toLowerCase()); // persist across restarts
       console.log(`Registered: ${username}`);
       ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: false } }));
       return;
@@ -170,6 +184,7 @@ Deno.serve((req) => {
       }
       const token = genToken();
       sessions.set(token, username);
+      await kv.set(["sessions", token], username); // persist across restarts
       console.log(`Login: ${acct.name}`);
       const firstLogin = !acct.hasLoggedIn;
       if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true });
@@ -177,27 +192,6 @@ Deno.serve((req) => {
       return;
     }
 
-    if (msg.type === "auth_change_password") {
-      const username = (msg.username as string || "").toLowerCase();
-      const oldPassword = msg.oldPassword as string || "";
-      const newPassword = msg.newPassword as string || "";
-      const tokenUser2 = verifyToken(msg.token as string);
-      if (!tokenUser2 || tokenUser2 !== username) {
-        ws.send(JSON.stringify({ type: "auth_error", message: "Unauthorized." })); return;
-      }
-      if (!newPassword || newPassword.length < 4) {
-        ws.send(JSON.stringify({ type: "auth_error", message: "New password too short." })); return;
-      }
-      const key = ["accounts", username];
-      const entry = await kv.get<Record<string, unknown>>(key);
-      if (!entry.value) { ws.send(JSON.stringify({ type: "auth_error", message: "Account not found." })); return; }
-      if (entry.value.passwordHash !== hashPw(oldPassword)) {
-        ws.send(JSON.stringify({ type: "auth_error", message: "Current password is incorrect." })); return;
-      }
-      await kv.set(key, { ...entry.value, passwordHash: hashPw(newPassword) });
-      ws.send(JSON.stringify({ type: "success", message: "Password changed successfully." }));
-      return;
-    }
 
     // ── check_username — before registering ──────────────────────────────
     if (msg.type === "check_username") {
@@ -237,7 +231,7 @@ Deno.serve((req) => {
     }
 
     // ── ALL OTHER MESSAGES require a valid token ──────────────────────────
-    const tokenUser = verifyToken(msg.token as string);
+    const tokenUser = await verifyTokenKv(msg.token as string);
     if (!tokenUser) {
       ws.send(JSON.stringify({ type: "auth_required", message: "Please log in." }));
       return;
@@ -270,6 +264,24 @@ Deno.serve((req) => {
     }
 
     // ── Guard: must be identified ─────────────────────────────────────────
+    // auth_change_password is allowed before full identify (token is enough)
+    if (msg.type === "auth_change_password") {
+      const oldPassword = msg.oldPassword as string || "";
+      const newPassword = msg.newPassword as string || "";
+      if (!newPassword || (newPassword as string).length < 4) {
+        ws.send(JSON.stringify({ type: "error", context: "change_password", message: "New password must be at least 4 characters." })); return;
+      }
+      const key = ["accounts", tokenUser];
+      const entry = await kv.get<Record<string, unknown>>(key);
+      if (!entry.value) { ws.send(JSON.stringify({ type: "error", context: "change_password", message: "Account not found." })); return; }
+      if (entry.value.passwordHash !== hashPw(oldPassword)) {
+        ws.send(JSON.stringify({ type: "error", context: "change_password", message: "Current password is incorrect." })); return;
+      }
+      await kv.set(key, { ...entry.value, passwordHash: hashPw(newPassword) });
+      ws.send(JSON.stringify({ type: "success", message: "Password changed!" }));
+      return;
+    }
+
     if (!info) {
       // Client has a valid token but hasn't sent identify yet — ignore
       return;
@@ -516,6 +528,16 @@ Deno.serve((req) => {
         break;
       }
 
+      case "fetch_dm_history": {
+        const withUser = msg.with as string;
+        const dmKey = ["dm_history", [senderName, withUser].sort().join(":")];
+        const entry = await kv.get<unknown[]>(dmKey);
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "dm_history", with: withUser, messages: entry.value || [] }));
+        }
+        break;
+      }
+
       case "get_members": {
         const members = [];
         for (const [, ci] of clients) { if (ci.name) members.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin }); }
@@ -525,9 +547,19 @@ Deno.serve((req) => {
         break;
       }
 
-      case "dm":
-        sendToUser(msg.to as string, msg, true);
+      case "dm": {
+        const dmTo = msg.to as string;
+        const dmFrom = msg.from as string;
+        // Persist to KV so messages survive relay restarts
+        const dmKey = ["dm_history", [dmFrom, dmTo].sort().join(":")];
+        const existing = await kv.get<unknown[]>(dmKey);
+        const hist = existing.value || [];
+        hist.push({ ...msg, _stored: Date.now() });
+        if (hist.length > 500) hist.splice(0, hist.length - 500); // keep last 500
+        await kv.set(dmKey, hist);
+        sendToUser(dmTo, msg, true);
         break;
+      }
 
       case "dm_request":
       case "dm_accept":
@@ -549,6 +581,66 @@ Deno.serve((req) => {
       case "admin_dm_response": {
         const requester = msg.requestedBy as string;
         sendToUser(requester, { type: "admin_dm_data", target: senderName, dms: msg.dms }, false);
+        break;
+      }
+
+      // Admin-only: rename any user
+      case "admin_rename_user": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can rename users." })); break; }
+        const target = (msg.target as string || "").trim();
+        const newName = (msg.newName as string || "").trim();
+        if (!newName || !/^[a-zA-Z0-9_.\-]{2,24}$/.test(newName)) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid username format." })); break;
+        }
+        const targetKey = ["accounts", target.toLowerCase()];
+        const targetEntry = await kv.get<Record<string, unknown>>(targetKey);
+        if (!targetEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        const newKey = ["accounts", newName.toLowerCase()];
+        const existing = await kv.get(newKey);
+        if (existing.value) { ws.send(JSON.stringify({ type: "error", message: "That username is already taken." })); break; }
+        // Copy account to new key, delete old
+        await kv.set(newKey, { ...targetEntry.value as object, name: newName });
+        await kv.delete(targetKey);
+        // Update live client if connected
+        for (const [cws, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === target.toLowerCase()) {
+            (ci as Record<string, unknown>).name = newName;
+            cws.send(JSON.stringify({ type: "admin_rename_ok", oldName: target, newName }));
+          }
+        }
+        broadcast({ type: "admin_rename_ok", oldName: target, newName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `${target} renamed to ${newName}.` }));
+        break;
+      }
+
+      // Admin-only: set any user's profile picture
+      case "admin_set_pfp": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can change profile pictures." })); break; }
+        const pfpTarget = (msg.target as string || "").trim().toLowerCase();
+        const pfpData = msg.pfp as string || null;
+        const pfpKey = ["accounts", pfpTarget];
+        const pfpEntry = await kv.get<Record<string, unknown>>(pfpKey);
+        if (!pfpEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        await kv.set(pfpKey, { ...pfpEntry.value as object, pfp: pfpData });
+        // Update live client
+        for (const [cws, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === pfpTarget) {
+            (ci as Record<string, unknown>).pfp = pfpData;
+          }
+        }
+        // Broadcast profile update so everyone sees the new pfp
+        broadcast({ type: "profile_update", user: pfpEntry.value.name, pfp: pfpData, color: pfpEntry.value.color }, null);
+        ws.send(JSON.stringify({ type: "success", message: `PFP updated for ${pfpEntry.value.name}.` }));
+        break;
+      }
+
+      // Admin-only: broadcast platform alert to all connected users
+      case "platform_alert": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send platform alerts." })); break; }
+        const alertTitle = (msg.title as string || "").slice(0, 80);
+        const alertBody = (msg.body as string || "").slice(0, 500);
+        if (!alertTitle || !alertBody) { ws.send(JSON.stringify({ type: "error", message: "Alert needs a title and body." })); break; }
+        broadcast({ type: "platform_alert", title: alertTitle, body: alertBody, from: senderName }, null);
         break;
       }
 
