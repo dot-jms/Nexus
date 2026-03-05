@@ -599,29 +599,40 @@ Deno.serve((req) => {
       }
 
       case "announce_servers":
-        (msg.servers as unknown[] || []).forEach((sv: unknown) => {
+        // Upsert into both in-memory map and KV
+        for (const sv of (msg.servers as unknown[] || [])) {
           const s = sv as Record<string, unknown>;
-          if (!publicServers.has(s.id as string)) {
-            publicServers.set(s.id as string, {
-              id: s.id, name: s.name, desc: s.desc || "",
-              icon: s.icon || null, color: s.color || "#6c63ff",
-              memberCount: s.memberCount || 1, createdAt: s.createdAt || Date.now(),
-              channels: s.channels || [], ownerId: s.ownerId || null,
-            });
-          }
-        });
-        break;
-
-      case "get_server_list":
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "server_list", servers: [...publicServers.values()] }));
+          if (!s.id) continue;
+          const svEntry: Record<string, unknown> = {
+            id: s.id, name: s.name, desc: s.desc || "",
+            icon: s.icon || null, color: s.color || "#6c63ff",
+            memberCount: s.memberCount || 1, createdAt: s.createdAt || Date.now(),
+            channels: s.channels || [], ownerId: s.ownerId || senderName, isPublic: true,
+          };
+          publicServers.set(s.id as string, svEntry);
+          await kv.set(["servers", s.id as string], svEntry);
         }
         break;
 
+      case "get_server_list": {
+        // Always read from KV — in-memory map is unreliable on Deno Deploy (multiple isolates)
+        const svListIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
+        const svList: Record<string, unknown>[] = [];
+        for await (const item of svListIter) {
+          if (item.value && item.value.isPublic !== false) svList.push(item.value);
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "server_list", servers: svList }));
+        }
+        break;
+      }
+
       case "get_server_info": {
-        const sv = publicServers.get(msg.serverId as string);
-        if (sv && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "server_info", server: sv }));
+        // Try KV first for authoritative data
+        const svInfoEntry = await kv.get<Record<string, unknown>>(["servers", msg.serverId as string]);
+        const svInfo = svInfoEntry.value || publicServers.get(msg.serverId as string);
+        if (svInfo && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "server_info", server: svInfo }));
         }
         break;
       }
