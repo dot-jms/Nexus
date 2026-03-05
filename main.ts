@@ -270,11 +270,15 @@ Deno.serve((req) => {
       });
       // Collect servers this user is a member of — use user-indexed key for reliability
       const userServers: Record<string, unknown>[] = [];
-      const userSvIds = (await kv.get<string[]>(["user_servers", name])).value || [];
+      const userSvIdsEntry = await kv.get<string[]>(["user_servers", name]);
+      console.log(`[identify] user=${name} user_servers_key=${JSON.stringify(userSvIdsEntry.value)}`);
+      const userSvIds = userSvIdsEntry.value || [];
       for (const svId of userSvIds) {
         const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+        console.log(`[identify] svId=${svId} found=${!!svEntry.value} isPublic=${svEntry.value?.isPublic}`);
         if (svEntry.value) userServers.push(svEntry.value);
       }
+      console.log(`[identify] sending ${userServers.length} servers to ${name}`);
       // Also collect KV friends/requests
       const friendsList = (await kv.get(["friends", tokenUser])).value || [];
       const pendingReqs: unknown[] = [];
@@ -532,6 +536,7 @@ Deno.serve((req) => {
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
         // Persist to KV so servers survive cache wipes
         await kv.set(["servers", msg.serverId as string], svData);
+        console.log(`[server_create] saved server id=${msg.serverId} name=${msg.name} isPublic=${svData.isPublic}`);
         // Track membership — both direction indexes
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         {
@@ -541,6 +546,7 @@ Deno.serve((req) => {
             userSvs.push(msg.serverId as string);
             await kv.set(["user_servers", senderName], userSvs);
           }
+          console.log(`[server_create] user_servers for ${senderName}: ${JSON.stringify(userSvs)}`);
         }
         broadcast(msg, ws);
         break;
@@ -548,7 +554,9 @@ Deno.serve((req) => {
 
       case "server_update": {
         const sid = msg.serverId as string;
+        console.log(`[server_update] sid=${sid} isPublic=${msg.isPublic} name=${msg.name} from=${senderName}`);
         const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
+        console.log(`[server_update] existing in KV: ${!!existing.value} inMemory: ${publicServers.has(sid)}`);
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
           if (msg.isPublic === false) {
@@ -644,8 +652,10 @@ Deno.serve((req) => {
         const svListIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
         const svList: Record<string, unknown>[] = [];
         for await (const item of svListIter) {
+          console.log(`[get_server_list] key=${JSON.stringify(item.key)} isPublic=${item.value?.isPublic} name=${item.value?.name}`);
           if (item.value && item.value.isPublic !== false) svList.push(item.value);
         }
+        console.log(`[get_server_list] returning ${svList.length} servers to ${senderName}`);
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "server_list", servers: svList }));
         }
