@@ -252,6 +252,15 @@ Deno.serve((req) => {
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
       });
+      // Load friends and pending requests from KV
+      const friendsList = (await kv.get<unknown[]>(["friends", tokenUser])).value || [];
+      // Collect pending friend requests for this user
+      const pendingReqs: unknown[] = [];
+      const reqPrefix = ["friend_requests", tokenUser];
+      const reqIter = kv.list({ prefix: reqPrefix });
+      for await (const item of reqIter) {
+        pendingReqs.push(item.value);
+      }
       // Send back fresh account data so client always has correct role
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -265,7 +274,9 @@ Deno.serve((req) => {
             coAdmin: acct?.coAdmin || false,
             bio: acct?.bio || "",
             socials: acct?.socials || {}
-          }
+          },
+          friends: friendsList,
+          friendRequests: pendingReqs,
         }));
       }
       // Flush queued offline messages
@@ -580,11 +591,56 @@ Deno.serve((req) => {
       case "dm_request":
       case "dm_accept":
       case "dm_decline":
-      case "friend_request":
-      case "friend_accept":
-      case "friend_decline":
         sendToUser(msg.to as string, msg, true);
         break;
+
+      case "friend_request": {
+        const frTo = (msg.to as string || "").toLowerCase();
+        const frFrom = senderName.toLowerCase();
+        await kv.set(["friend_requests", frTo, frFrom], {
+          name: senderName,
+          direction: "in",
+          pfp: msg.fromPfp || null,
+          color: msg.fromColor || null,
+          ts: Date.now(),
+        });
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_accept": {
+        const faTo = (msg.to as string || "").toLowerCase();
+        const faFrom = senderName.toLowerCase();
+        const senderInfo = clients.get(ws) as Record<string,unknown> || {};
+        const f2Entry = await kv.get<Record<string,unknown>>(["accounts", faTo]);
+        const f1 = { name: senderName, pfp: senderInfo.pfp || null, color: senderInfo.color || null, ts: Date.now() };
+        const f2 = { name: f2Entry.value?.name || msg.to, pfp: f2Entry.value?.pfp || null, color: f2Entry.value?.color || null, ts: Date.now() };
+        const fl1 = (await kv.get<unknown[]>(["friends", faFrom])).value || [];
+        if (!fl1.find((f: unknown) => (f as Record<string,unknown>).name === f2.name)) fl1.push(f2);
+        await kv.set(["friends", faFrom], fl1);
+        const fl2 = (await kv.get<unknown[]>(["friends", faTo])).value || [];
+        if (!fl2.find((f: unknown) => (f as Record<string,unknown>).name === senderName)) fl2.push(f1);
+        await kv.set(["friends", faTo], fl2);
+        await kv.delete(["friend_requests", faFrom, faTo]);
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_decline": {
+        await kv.delete(["friend_requests", senderName.toLowerCase(), (msg.to as string || "").toLowerCase()]);
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_remove": {
+        const rmFrom = senderName.toLowerCase();
+        const rmTarget = (msg.target as string || "").toLowerCase();
+        const fListA = (await kv.get<unknown[]>(["friends", rmFrom])).value;
+        if (fListA) await kv.set(["friends", rmFrom], fListA.filter((f: unknown) => (f as Record<string,unknown>).name?.toString().toLowerCase() !== rmTarget));
+        const fListB = (await kv.get<unknown[]>(["friends", rmTarget])).value;
+        if (fListB) await kv.set(["friends", rmTarget], fListB.filter((f: unknown) => (f as Record<string,unknown>).name?.toString().toLowerCase() !== rmFrom));
+        break;
+      }
 
       case "short_post":
       case "short_like":
