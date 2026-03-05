@@ -111,6 +111,22 @@ function isBanned(username: string): boolean {
   return false;
 }
 
+// ─── Load persisted servers into memory on startup ──────────────────────────
+{
+  const svIter = kv.list<Record<string,unknown>>({ prefix: ["servers"] });
+  for await (const item of svIter) {
+    const sv = item.value;
+    if (sv && sv.isPublic !== false) publicServers.set(sv.id as string, sv);
+  }
+  console.log(`Loaded ${publicServers.size} servers from KV`);
+  // Warm in-memory msgHistory from KV for fast access
+  const chIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
+  for await (const item of chIter) {
+    const chId = item.key[1] as string;
+    if (item.value?.length) msgHistory.set(chId, item.value);
+  }
+}
+
 // ─── Main server ────────────────────────────────────────────────────────────
 Deno.serve((req) => {
   if (req.headers.get("upgrade") !== "websocket") {
@@ -252,15 +268,21 @@ Deno.serve((req) => {
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
       });
-      // Load friends and pending requests from KV
-      const friendsList = (await kv.get<unknown[]>(["friends", tokenUser])).value || [];
-      // Collect pending friend requests for this user
-      const pendingReqs: unknown[] = [];
-      const reqPrefix = ["friend_requests", tokenUser];
-      const reqIter = kv.list({ prefix: reqPrefix });
-      for await (const item of reqIter) {
-        pendingReqs.push(item.value);
+      // Collect servers this user is a member of from KV
+      const userServers: Record<string, unknown>[] = [];
+      const memPrefix = kv.list({ prefix: ["server_member"] });
+      for await (const item of memPrefix) {
+        if ((item.key[2] as string) === name) {
+          const svId = item.key[1] as string;
+          const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+          if (svEntry.value) userServers.push(svEntry.value);
+        }
       }
+      // Also collect KV friends/requests
+      const friendsList = (await kv.get(["friends", tokenUser])).value || [];
+      const pendingReqs: unknown[] = [];
+      const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
+      for await (const item of reqIter) pendingReqs.push(item.value);
       // Send back fresh account data so client always has correct role
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -275,6 +297,7 @@ Deno.serve((req) => {
             bio: acct?.bio || "",
             socials: acct?.socials || {}
           },
+          servers: userServers,
           friends: friendsList,
           friendRequests: pendingReqs,
         }));
@@ -384,15 +407,23 @@ Deno.serve((req) => {
       return;
     }
 
-    // ── Admin: view DMs ───────────────────────────────────────────────────
+    // ── Admin: view DMs — reads directly from KV, no need for target to be online ──
     if (msg.type === "admin_view_dms") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
-      const targetUser = msg.target as string;
-      // Return any DM messages we have in memory (we only have live/recent ones)
-      // The relay doesn't store DMs persistently (they live in localStorage)
-      // We can request the target user to send their DM history
-      sendToUser(targetUser, { type: "admin_dm_request", requestedBy: senderName }, false);
-      ws.send(JSON.stringify({ type: "info", message: `Requested DM history from ${targetUser}. They must be online.` }));
+      const targetUser = (msg.target as string || "").trim().toLowerCase();
+      if (!targetUser) { ws.send(JSON.stringify({ type: "error", message: "Specify a username." })); return; }
+      const prefix = ["dm_history"];
+      const iter = kv.list<unknown[]>({ prefix });
+      const convos: { name: string; messages: unknown[] }[] = [];
+      for await (const item of iter) {
+        const key = item.key[1] as string;
+        const parts = key.split(":");
+        if (parts.some((p: string) => p.toLowerCase() === targetUser)) {
+          const otherName = parts.find((p: string) => p.toLowerCase() !== targetUser) || "unknown";
+          convos.push({ name: otherName, messages: item.value || [] });
+        }
+      }
+      ws.send(JSON.stringify({ type: "admin_dm_data", target: targetUser, dms: convos }));
       return;
     }
 
@@ -426,15 +457,25 @@ Deno.serve((req) => {
 
     switch (msg.type) {
       case "message": {
+        // Persist to KV for new joiners to see history
+        const chKey = ["ch_history", msg.channelId as string];
+        const chEntry = await kv.get<unknown[]>(chKey);
+        const chHist = chEntry.value || [];
+        chHist.push(msg);
+        if (chHist.length > 500) chHist.splice(0, chHist.length - 500);
+        await kv.set(chKey, chHist);
+        // Also keep in-memory for fast retrieval
         storeMessage(msg.channelId as string, msg);
         broadcast(msg, ws);
         break;
       }
 
       case "get_history": {
-        const hist = msgHistory.get(msg.channelId as string) || [];
+        const chHistKey = ["ch_history", msg.channelId as string];
+        const chHistEntry = await kv.get<unknown[]>(chHistKey);
+        const fullHist = chHistEntry.value || msgHistory.get(msg.channelId as string) || [];
         const since = (msg.since as number) || 0;
-        const unseen = hist.filter((m: unknown) => (m as Record<string, number>).ts > since);
+        const unseen = fullHist.filter((m: unknown) => (m as Record<string, number>).ts > since);
         if (unseen.length && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "history", channelId: msg.channelId, messages: unseen }));
         }
@@ -484,45 +525,65 @@ Deno.serve((req) => {
       }
 
       case "server_create": {
-        if (msg.isPublic !== false) {
-          publicServers.set(msg.serverId as string, {
-            id: msg.serverId, name: msg.name, desc: msg.desc || "",
-            icon: msg.icon || null, color: msg.color || "#6c63ff",
-            memberCount: 1, createdAt: msg.createdAt || Date.now(),
-            channels: msg.channels || [], ownerId: senderName,
-          });
-        }
+        const svData = {
+          id: msg.serverId, name: msg.name, desc: msg.desc || "",
+          icon: msg.icon || null, color: msg.color || "#6c63ff",
+          memberCount: 1, createdAt: msg.createdAt || Date.now(),
+          channels: msg.channels || [], ownerId: senderName,
+          isPublic: msg.isPublic !== false,
+        };
+        if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
+        // Persist to KV so servers survive cache wipes
+        await kv.set(["servers", msg.serverId as string], svData);
+        // Track membership
+        await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         broadcast(msg, ws);
         break;
       }
 
       case "server_update": {
         const sid = msg.serverId as string;
+        const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
-          if (msg.isPublic === false) publicServers.delete(sid);
-          else publicServers.set(sid, { ...sv, ...msg });
+          if (msg.isPublic === false) { publicServers.delete(sid); }
+          else { const updated = { ...sv, ...msg }; publicServers.set(sid, updated); await kv.set(["servers", sid], updated); }
         } else if (msg.isPublic === true) {
-          publicServers.set(sid, {
-            id: sid, name: msg.name, desc: msg.desc || "",
-            icon: msg.icon || null, color: msg.color || "#6c63ff",
-            memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(),
-            channels: msg.channels || [], ownerId: msg.ownerId || senderName,
-          });
+          const updated = { id: sid, name: msg.name, desc: msg.desc || "", icon: msg.icon || null, color: msg.color || "#6c63ff", memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(), channels: msg.channels || [], ownerId: msg.ownerId || senderName, isPublic: true };
+          publicServers.set(sid, updated);
+          await kv.set(["servers", sid], updated);
+        } else if (existing.value) {
+          const updated = { ...existing.value, ...msg };
+          await kv.set(["servers", sid], updated);
         }
         broadcast(msg, ws);
         break;
       }
 
       case "server_delete":
-      case "leave_server":
         publicServers.delete(msg.serverId as string);
+        await kv.delete(["servers", msg.serverId as string]);
+        // Delete all channel history for this server
+        {
+          const svEntry = await kv.get<Record<string,unknown>>(["servers", msg.serverId as string]);
+          const channels = (svEntry.value?.channels as Array<{id:string}>) || [];
+          for (const ch of channels) { await kv.delete(["ch_history", ch.id]); }
+          // Delete memberships
+          const memIter = kv.list({ prefix: ["server_member", msg.serverId as string] });
+          for await (const item of memIter) { await kv.delete(item.key); }
+        }
+        broadcast(msg, ws);
+        break;
+      case "leave_server":
+        await kv.delete(["server_member", msg.serverId as string, senderName]);
         broadcast(msg, ws);
         break;
 
       case "join_server": {
         const sv = publicServers.get(msg.serverId as string);
-        if (sv) sv.memberCount = ((sv.memberCount as number) || 1) + 1;
+        if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", msg.serverId as string], sv); }
+        // Track membership so we can show offline members
+        await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         broadcast(msg, ws);
         break;
       }
@@ -566,10 +627,30 @@ Deno.serve((req) => {
       }
 
       case "get_members": {
-        const members = [];
-        for (const [, ci] of clients) { if (ci.name) members.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin }); }
+        const onlineNames = new Set<string>();
+        const onlineMembers = [];
+        for (const [, ci] of clients) {
+          if (ci.name) {
+            onlineNames.add(ci.name as string);
+            onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
+          }
+        }
+        // Also include offline members who have joined this server
+        const svId = msg.serverId as string;
+        const memIter2 = kv.list({ prefix: ["server_member", svId] });
+        const offlineMembers = [];
+        for await (const item of memIter2) {
+          const mName = item.key[2] as string;
+          if (!onlineNames.has(mName)) {
+            const mAcct = await kv.get<Record<string,unknown>>(["accounts", mName.toLowerCase()]);
+            if (mAcct.value) {
+              offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
+            }
+          }
+        }
+        const allMembers = [...onlineMembers, ...offlineMembers];
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members }));
+          ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: allMembers }));
         }
         break;
       }
@@ -591,56 +672,11 @@ Deno.serve((req) => {
       case "dm_request":
       case "dm_accept":
       case "dm_decline":
+      case "friend_request":
+      case "friend_accept":
+      case "friend_decline":
         sendToUser(msg.to as string, msg, true);
         break;
-
-      case "friend_request": {
-        const frTo = (msg.to as string || "").toLowerCase();
-        const frFrom = senderName.toLowerCase();
-        await kv.set(["friend_requests", frTo, frFrom], {
-          name: senderName,
-          direction: "in",
-          pfp: msg.fromPfp || null,
-          color: msg.fromColor || null,
-          ts: Date.now(),
-        });
-        sendToUser(msg.to as string, msg, true);
-        break;
-      }
-
-      case "friend_accept": {
-        const faTo = (msg.to as string || "").toLowerCase();
-        const faFrom = senderName.toLowerCase();
-        const senderInfo = clients.get(ws) as Record<string,unknown> || {};
-        const f2Entry = await kv.get<Record<string,unknown>>(["accounts", faTo]);
-        const f1 = { name: senderName, pfp: senderInfo.pfp || null, color: senderInfo.color || null, ts: Date.now() };
-        const f2 = { name: f2Entry.value?.name || msg.to, pfp: f2Entry.value?.pfp || null, color: f2Entry.value?.color || null, ts: Date.now() };
-        const fl1 = (await kv.get<unknown[]>(["friends", faFrom])).value || [];
-        if (!fl1.find((f: unknown) => (f as Record<string,unknown>).name === f2.name)) fl1.push(f2);
-        await kv.set(["friends", faFrom], fl1);
-        const fl2 = (await kv.get<unknown[]>(["friends", faTo])).value || [];
-        if (!fl2.find((f: unknown) => (f as Record<string,unknown>).name === senderName)) fl2.push(f1);
-        await kv.set(["friends", faTo], fl2);
-        await kv.delete(["friend_requests", faFrom, faTo]);
-        sendToUser(msg.to as string, msg, true);
-        break;
-      }
-
-      case "friend_decline": {
-        await kv.delete(["friend_requests", senderName.toLowerCase(), (msg.to as string || "").toLowerCase()]);
-        sendToUser(msg.to as string, msg, true);
-        break;
-      }
-
-      case "friend_remove": {
-        const rmFrom = senderName.toLowerCase();
-        const rmTarget = (msg.target as string || "").toLowerCase();
-        const fListA = (await kv.get<unknown[]>(["friends", rmFrom])).value;
-        if (fListA) await kv.set(["friends", rmFrom], fListA.filter((f: unknown) => (f as Record<string,unknown>).name?.toString().toLowerCase() !== rmTarget));
-        const fListB = (await kv.get<unknown[]>(["friends", rmTarget])).value;
-        if (fListB) await kv.set(["friends", rmTarget], fListB.filter((f: unknown) => (f as Record<string,unknown>).name?.toString().toLowerCase() !== rmFrom));
-        break;
-      }
 
       case "short_post":
       case "short_like":
