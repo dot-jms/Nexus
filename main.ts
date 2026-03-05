@@ -256,9 +256,24 @@ Deno.serve((req) => {
     // ── identify — register this WS with the verified username ───────────
     if (msg.type === "identify") {
       const key = ["accounts", tokenUser];
+      // Register client synchronously first so subsequent messages aren't dropped
+      // while we do async KV lookups below
+      const earlyName = tokenUser;
+      if (!clients.has(ws)) {
+        clients.set(ws, {
+          name: earlyName,
+          tag: "0000",
+          color: msg.color || "#6c63ff",
+          pfp: msg.pfp || null,
+          token: msg.token,
+          systemRole: "user",
+          coAdmin: false,
+        });
+      }
       const entry = await kv.get<Record<string, unknown>>(key);
       const acct = entry.value;
       const name = acct?.name as string || tokenUser;
+      // Update with real account data now that we have it
       clients.set(ws, {
         name,
         tag: acct?.tag || "0000",
