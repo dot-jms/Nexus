@@ -291,7 +291,20 @@ Deno.serve((req) => {
       for (const svId of userSvIds) {
         const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
         console.log(`[identify] svId=${svId} found=${!!svEntry.value} isPublic=${svEntry.value?.isPublic}`);
-        if (svEntry.value) userServers.push(svEntry.value);
+        if (svEntry.value) {
+          const sv = svEntry.value;
+          // Strip base64 icon to keep frame small — client fetches full info separately
+          userServers.push({
+            id: sv.id, name: sv.name, desc: sv.desc || "",
+            color: sv.color || "#6c63ff",
+            icon: null,
+            channels: sv.channels || [],
+            ownerId: sv.ownerId,
+            memberCount: sv.memberCount || 1,
+            createdAt: sv.createdAt || 0,
+            isPublic: sv.isPublic !== false,
+          });
+        }
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
       // Also collect KV friends/requests
@@ -663,14 +676,22 @@ Deno.serve((req) => {
         break;
 
       case "get_server_list": {
-        // Always read from KV — in-memory map is unreliable on Deno Deploy (multiple isolates)
         const svListIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
         const svList: Record<string, unknown>[] = [];
         for await (const item of svListIter) {
-          console.log(`[get_server_list] key=${JSON.stringify(item.key)} isPublic=${item.value?.isPublic} name=${item.value?.name}`);
-          if (item.value && item.value.isPublic !== false) svList.push(item.value);
+          const sv = item.value;
+          if (sv && sv.isPublic !== false) {
+            // Strip icon to keep payload small
+            svList.push({
+              id: sv.id, name: sv.name, desc: sv.desc || "",
+              color: sv.color || "#6c63ff", icon: null,
+              memberCount: sv.memberCount || 1,
+              createdAt: sv.createdAt || 0,
+              channels: sv.channels || [],
+              ownerId: sv.ownerId, isPublic: true,
+            });
+          }
         }
-        console.log(`[get_server_list] returning ${svList.length} servers to ${senderName}`);
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "server_list", servers: svList }));
         }
