@@ -171,7 +171,31 @@ Deno.serve((req) => {
       const token = genToken();
       sessions.set(token, username);
       console.log(`Login: ${acct.name}`);
-      ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: acct.coAdmin || false } }));
+      const firstLogin = !acct.hasLoggedIn;
+      if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true });
+      ws.send(JSON.stringify({ type: "auth_ok", token, firstLogin: !!firstLogin, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: acct.coAdmin || false } }));
+      return;
+    }
+
+    if (msg.type === "auth_change_password") {
+      const username = (msg.username as string || "").toLowerCase();
+      const oldPassword = msg.oldPassword as string || "";
+      const newPassword = msg.newPassword as string || "";
+      const tokenUser2 = verifyToken(msg.token as string);
+      if (!tokenUser2 || tokenUser2 !== username) {
+        ws.send(JSON.stringify({ type: "auth_error", message: "Unauthorized." })); return;
+      }
+      if (!newPassword || newPassword.length < 4) {
+        ws.send(JSON.stringify({ type: "auth_error", message: "New password too short." })); return;
+      }
+      const key = ["accounts", username];
+      const entry = await kv.get<Record<string, unknown>>(key);
+      if (!entry.value) { ws.send(JSON.stringify({ type: "auth_error", message: "Account not found." })); return; }
+      if (entry.value.passwordHash !== hashPw(oldPassword)) {
+        ws.send(JSON.stringify({ type: "auth_error", message: "Current password is incorrect." })); return;
+      }
+      await kv.set(key, { ...entry.value, passwordHash: hashPw(newPassword) });
+      ws.send(JSON.stringify({ type: "success", message: "Password changed successfully." }));
       return;
     }
 
@@ -402,6 +426,21 @@ Deno.serve((req) => {
             tws.send(JSON.stringify(msg));
           }
         }
+        break;
+      }
+
+      // ── Voice calls (P2P, routed to specific user) ──
+      case "vcall_invite":
+      case "vcall_accept":
+      case "vcall_decline":
+      case "vcall_signal": {
+        const target = msg.to as string;
+        sendToUser(target, msg, true);
+        break;
+      }
+      case "vcall_end": {
+        // Broadcast end to all participants
+        broadcast(msg, ws);
         break;
       }
 
