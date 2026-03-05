@@ -268,15 +268,12 @@ Deno.serve((req) => {
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
       });
-      // Collect servers this user is a member of from KV
+      // Collect servers this user is a member of — use user-indexed key for reliability
       const userServers: Record<string, unknown>[] = [];
-      const memPrefix = kv.list({ prefix: ["server_member"] });
-      for await (const item of memPrefix) {
-        if ((item.key[2] as string) === name) {
-          const svId = item.key[1] as string;
-          const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
-          if (svEntry.value) userServers.push(svEntry.value);
-        }
+      const userSvIds = (await kv.get<string[]>(["user_servers", name])).value || [];
+      for (const svId of userSvIds) {
+        const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+        if (svEntry.value) userServers.push(svEntry.value);
       }
       // Also collect KV friends/requests
       const friendsList = (await kv.get(["friends", tokenUser])).value || [];
@@ -535,8 +532,16 @@ Deno.serve((req) => {
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
         // Persist to KV so servers survive cache wipes
         await kv.set(["servers", msg.serverId as string], svData);
-        // Track membership
+        // Track membership — both direction indexes
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
+        {
+          const userSvsEntry = await kv.get<string[]>(["user_servers", senderName]);
+          const userSvs = userSvsEntry.value || [];
+          if (!userSvs.includes(msg.serverId as string)) {
+            userSvs.push(msg.serverId as string);
+            await kv.set(["user_servers", senderName], userSvs);
+          }
+        }
         broadcast(msg, ws);
         break;
       }
@@ -570,30 +575,50 @@ Deno.serve((req) => {
         break;
       }
 
-      case "server_delete":
-        publicServers.delete(msg.serverId as string);
-        await kv.delete(["servers", msg.serverId as string]);
-        // Delete all channel history for this server
-        {
-          const svEntry = await kv.get<Record<string,unknown>>(["servers", msg.serverId as string]);
-          const channels = (svEntry.value?.channels as Array<{id:string}>) || [];
-          for (const ch of channels) { await kv.delete(["ch_history", ch.id]); }
-          // Delete memberships
-          const memIter = kv.list({ prefix: ["server_member", msg.serverId as string] });
-          for await (const item of memIter) { await kv.delete(item.key); }
+      case "server_delete": {
+        const delSvId = msg.serverId as string;
+        const delSvEntry = await kv.get<Record<string,unknown>>(["servers", delSvId]);
+        publicServers.delete(delSvId);
+        await kv.delete(["servers", delSvId]);
+        // Delete all channel history
+        const delChannels = (delSvEntry.value?.channels as Array<{id:string}>) || [];
+        for (const ch of delChannels) { await kv.delete(["ch_history", ch.id]); }
+        // Delete memberships and remove from user_servers indexes
+        const delMemIter = kv.list({ prefix: ["server_member", delSvId] });
+        for await (const item of delMemIter) {
+          const memberName = item.key[2] as string;
+          await kv.delete(item.key);
+          const usvEntry = await kv.get<string[]>(["user_servers", memberName]);
+          if (usvEntry.value) {
+            await kv.set(["user_servers", memberName], usvEntry.value.filter((id: string) => id !== delSvId));
+          }
         }
         broadcast(msg, ws);
         break;
-      case "leave_server":
+      }
+      case "leave_server": {
         await kv.delete(["server_member", msg.serverId as string, senderName]);
+        const userSvsL = await kv.get<string[]>(["user_servers", senderName]);
+        if (userSvsL.value) {
+          await kv.set(["user_servers", senderName], userSvsL.value.filter((id: string) => id !== msg.serverId));
+        }
         broadcast(msg, ws);
         break;
+      }
 
       case "join_server": {
         const sv = publicServers.get(msg.serverId as string);
         if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", msg.serverId as string], sv); }
         // Track membership so we can show offline members
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
+        {
+          const userSvsJ = await kv.get<string[]>(["user_servers", senderName]);
+          const userSvsJList = userSvsJ.value || [];
+          if (!userSvsJList.includes(msg.serverId as string)) {
+            userSvsJList.push(msg.serverId as string);
+            await kv.set(["user_servers", senderName], userSvsJList);
+          }
+        }
         broadcast(msg, ws);
         break;
       }
