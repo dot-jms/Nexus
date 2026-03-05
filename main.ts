@@ -252,6 +252,22 @@ Deno.serve((req) => {
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
       });
+      // Send back fresh account data so client always has correct role
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "identified",
+          user: {
+            name: acct?.name || tokenUser,
+            tag: acct?.tag || "0000",
+            color: acct?.color || "#6c63ff",
+            pfp: acct?.pfp || null,
+            systemRole: acct?.systemRole || "user",
+            coAdmin: acct?.coAdmin || false,
+            bio: acct?.bio || "",
+            socials: acct?.socials || {}
+          }
+        }));
+      }
       // Flush queued offline messages
       const queue = offline.get(name);
       if (queue?.length) {
