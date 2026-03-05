@@ -307,7 +307,47 @@ Deno.serve((req) => {
 
       // FIX: Look up user_servers by lowercased token user (consistent key)
       const userSvsKey = ["user_servers", tokenUser]; // tokenUser is already lowercase
-      const userSvIdsEntry = await kv.get<string[]>(userSvsKey);
+      let userSvIdsEntry = await kv.get<string[]>(userSvsKey);
+
+      // MIGRATION: if nothing found under lowercase key, check original-case name
+      // (handles servers created before the lowercase-key fix was deployed)
+      if (!userSvIdsEntry.value && name !== tokenUser) {
+        const oldKey = ["user_servers", name];
+        const oldEntry = await kv.get<string[]>(oldKey);
+        if (oldEntry.value?.length) {
+          console.log(`[migrate] moving user_servers from key="${name}" to "${tokenUser}"`);
+          await kv.set(userSvsKey, oldEntry.value);
+          await kv.delete(oldKey);
+          userSvIdsEntry = await kv.get<string[]>(userSvsKey);
+        }
+      }
+
+      // MIGRATION: also scan all servers in KV where ownerId matches this user
+      // (handles servers created before server_create saved user_servers at all)
+      {
+        const knownIds = new Set(userSvIdsEntry.value || []);
+        const svScanIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
+        const recovered: string[] = [];
+        for await (const item of svScanIter) {
+          const sv = item.value;
+          if (!sv) continue;
+          const owner = (sv.ownerId as string || "").toLowerCase();
+          if (owner === tokenUser && !knownIds.has(sv.id as string)) {
+            recovered.push(sv.id as string);
+            // Also ensure server_member entry exists
+            const memKey = ["server_member", sv.id as string, name];
+            const memEntry = await kv.get(memKey);
+            if (!memEntry.value) await kv.set(memKey, { joinedAt: Date.now() });
+          }
+        }
+        if (recovered.length) {
+          const merged = [...(userSvIdsEntry.value || []), ...recovered];
+          console.log(`[migrate] recovered ${recovered.length} orphaned server(s) for ${name}: ${recovered.join(", ")}`);
+          await kv.set(userSvsKey, merged);
+          userSvIdsEntry = await kv.get<string[]>(userSvsKey);
+        }
+      }
+
       console.log(`[identify] user=${name} (key=${tokenUser}) user_servers=${JSON.stringify(userSvIdsEntry.value)}`);
       const userSvIds = userSvIdsEntry.value || [];
 
