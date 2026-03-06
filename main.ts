@@ -273,6 +273,7 @@ Deno.serve((req) => {
     // ── ALL OTHER MESSAGES require a valid token ──────────────────────────
     const tokenUser = await verifyTokenKv(msg.token as string);
     if (!tokenUser) {
+      console.log(`[auth] token verification failed for type=${msg.type} token=${(msg.token as string || '').slice(0,16)}...`);
       ws.send(JSON.stringify({ type: "auth_required", message: "Please log in." }));
       return;
     }
