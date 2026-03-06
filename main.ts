@@ -1,4 +1,4 @@
-// Nexus WebSocket relay — Deno Deploy 
+// Nexus WebSocket relay — Deno Deploy
 // Server-side auth via Deno KV. Accounts persist across restarts.
 // Puck is the platform admin. Co-admins can be appointed by Puck.
 
@@ -416,11 +416,11 @@ Deno.serve((req) => {
       return;
     }
 
+    // Log every message type that makes it past token verification
+    console.log(`[msg] type=${msg.type} sender=${info?.name || "unidentified"}`);
+
     // ── Guard: must be identified ─────────────────────────────────────────
     if (!info) {
-      // Client has a valid token but hasn't sent identify yet —
-      // however server_create may arrive right after identify before
-      // the async KV lookup completes, so log it clearly
       console.log(`[guard] dropping msg type=${msg.type} — client not yet identified`);
       return;
     }
