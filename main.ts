@@ -398,37 +398,6 @@ Deno.serve((req) => {
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
 
-      // ── Client-side server recovery ────────────────────────────────────────
-      // If the client sent locally-known servers that aren't in KV (e.g. after a
-      // Deno restart lost the KV write), re-register them now — ownerId is forced
-      // to the verified token user so clients can't hijack each other's servers.
-      if (Array.isArray(msg.localServers) && (msg.localServers as unknown[]).length) {
-        const knownIds = new Set(userServers.map(sv => sv.id as string));
-        for (const clientSv of msg.localServers as Record<string, unknown>[]) {
-          if (!clientSv.id || knownIds.has(clientSv.id as string)) continue;
-          const kvCheck = await kv.get(["servers", clientSv.id as string]);
-          if (!kvCheck.value) {
-            const recovered = {
-              id: clientSv.id, name: clientSv.name || "Unnamed Server",
-              desc: clientSv.desc || "", icon: clientSv.icon || null,
-              color: clientSv.color || "#6c63ff",
-              memberCount: clientSv.memberCount || 1,
-              createdAt: clientSv.createdAt || Date.now(),
-              channels: clientSv.channels || [],
-              ownerId: name, // always force to authenticated user
-              isPublic: clientSv.isPublic !== false,
-            };
-            if (recovered.isPublic) publicServers.set(recovered.id as string, recovered);
-            await kv.set(["servers", recovered.id as string], recovered);
-            await kv.set(["server_member", recovered.id as string, name], { joinedAt: Date.now() });
-            await addServerToUser(tokenUser, recovered.id as string);
-            userServers.push(recovered);
-            knownIds.add(recovered.id as string);
-            console.log(`[identify] recovered lost server "${recovered.name}" (${recovered.id}) for ${name}`);
-          }
-        }
-      }
-
       const friendsList = (await kv.get(["friends", tokenUser])).value || [];
       const pendingReqs: unknown[] = [];
       const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
@@ -785,15 +754,18 @@ Deno.serve((req) => {
       }
 
       case "get_members": {
+        const svId = msg.serverId as string;
         const onlineNames = new Set<string>();
         const onlineMembers = [];
+        // Only include online users who are actually members of this server
         for (const [, ci] of clients) {
-          if (ci.name) {
+          if (!ci.name) continue;
+          const memCheck = await kv.get(["server_member", svId, ci.name as string]);
+          if (memCheck.value) {
             onlineNames.add(ci.name as string);
             onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
           }
         }
-        const svId = msg.serverId as string;
         const memIter2 = kv.list({ prefix: ["server_member", svId] });
         const offlineMembers = [];
         for await (const item of memIter2) {
@@ -889,6 +861,25 @@ Deno.serve((req) => {
         const alertBody = (msg.body as string || "").slice(0, 500);
         if (!alertTitle || !alertBody) { ws.send(JSON.stringify({ type: "error", message: "Alert needs a title and body." })); break; }
         broadcast({ type: "platform_alert", title: alertTitle, body: alertBody, from: senderName }, null);
+        break;
+      }
+
+      case "admin_list_accounts": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can list accounts." })); break; }
+        const acctIter2 = kv.list<Record<string, unknown>>({ prefix: ["accounts"] });
+        const allAccounts: Record<string, unknown>[] = [];
+        for await (const item of acctIter2) {
+          const a = item.value;
+          if (!a) continue;
+          allAccounts.push({
+            name: a.name, tag: a.tag, color: a.color,
+            pfp: a.pfp || null, systemRole: a.systemRole || "user",
+            coAdmin: a.coAdmin || false, createdAt: a.createdAt || 0,
+            bio: a.bio || "",
+          });
+        }
+        allAccounts.sort((a, b) => ((a.createdAt as number) || 0) - ((b.createdAt as number) || 0));
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "admin_accounts_list", accounts: allAccounts }));
         break;
       }
 
