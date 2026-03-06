@@ -87,6 +87,19 @@ async function verifyTokenKv(token: string | undefined): Promise<string | null> 
     sessions.set(token, entry.value);
     return entry.value;
   }
+  // RECOVERY: session not in KV (e.g. after database wipe/swap).
+  // Scan accounts to find one whose last known token matches.
+  // This lets cached client tokens survive a KV reset.
+  const acctIter = kv.list<Record<string, unknown>>({ prefix: ["accounts"] });
+  for await (const item of acctIter) {
+    if (item.value?.lastToken === token) {
+      const username = item.key[1] as string;
+      sessions.set(token, username);
+      await kv.set(["sessions", token], username);
+      console.log(`[token-recovery] recovered session for ${username}`);
+      return username;
+    }
+  }
   return null;
 }
 
@@ -158,6 +171,7 @@ Deno.serve((req) => {
   ws.onmessage = async (e) => {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(e.data as string); } catch { return; }
+    console.log(`[recv] type=${msg.type}`);
     const info = clientInfo(ws);
 
     // ── AUTH — no token required ──────────────────────────────────────────
@@ -220,7 +234,8 @@ Deno.serve((req) => {
       await kv.set(["sessions", token], username);
       console.log(`Login: ${acct.name}`);
       const firstLogin = !acct.hasLoggedIn;
-      if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true });
+      if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true, lastToken: token });
+      else await kv.set(key, { ...acct, lastToken: token });
       ws.send(JSON.stringify({ type: "auth_ok", token, firstLogin: !!firstLogin, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: acct.coAdmin || false } }));
       return;
     }
@@ -285,9 +300,8 @@ Deno.serve((req) => {
       const key = ["accounts", tokenUser];
       // Register client immediately (synchronously) so subsequent messages aren't
       // dropped by the !info guard while we await KV reads below.
-      // FIX: use tokenUser (lowercase) as a stable early name; will be updated below.
       clients.set(ws, {
-        name: tokenUser, // temporary — overwritten after KV lookup
+        name: tokenUser,
         tag: "0000",
         color: msg.color || "#6c63ff",
         pfp: msg.pfp || null,
@@ -310,6 +324,12 @@ Deno.serve((req) => {
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
       });
+
+      // Re-persist the session token in case KV was wiped (e.g. new database attached)
+      // This means the next message with this token will verify correctly
+      sessions.set(msg.token as string, tokenUser);
+      await kv.set(["sessions", msg.token as string], tokenUser);
+      console.log(`[identify] re-persisted session token for ${name}`);
 
       // FIX: Look up user_servers by lowercased token user (consistent key)
       const userSvsKey = ["user_servers", tokenUser]; // tokenUser is already lowercase
