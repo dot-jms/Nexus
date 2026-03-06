@@ -619,11 +619,16 @@ Deno.serve((req) => {
 
       case "server_create": {
         console.log(`[server_create] RECEIVED from ${senderName} id=${msg.serverId} name=${msg.name}`);
+        // FIX: store ownerId as the canonical display name from the account record,
+        // but guarantee it's always findable via case-insensitive lookup.
+        // senderName comes from acct.name (display name), which is fine for display.
+        // The ownership check on clients uses case-insensitive compare so this is safe.
         const svData = {
           id: msg.serverId, name: msg.name, desc: msg.desc || "",
           icon: msg.icon || null, color: msg.color || "#6c63ff",
           memberCount: 1, createdAt: msg.createdAt || Date.now(),
           channels: msg.channels || [], ownerId: senderName,
+          ownerIdLower: senderName.toLowerCase(), // FIX: add lowercased copy for reliable matching
           isPublic: msg.isPublic !== false,
         };
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
@@ -653,25 +658,43 @@ Deno.serve((req) => {
       case "server_update": {
         const sid = msg.serverId as string;
         const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
+        // FIX: Guard - only owner or admin can update a server
+        const svForCheck = existing.value || publicServers.get(sid);
+        if (svForCheck) {
+          const storedOwnerLower = (svForCheck.ownerIdLower as string || (svForCheck.ownerId as string || "").toLowerCase());
+          if (storedOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) {
+            console.log(`[server_update] BLOCKED: ${senderName} tried to update server ${sid} owned by ${svForCheck.ownerId}`);
+            break;
+          }
+        }
+        // FIX: Never allow ownerId to be changed via server_update (only explicit transfer logic should do that)
+        // Strip ownerId from the incoming message so it can't overwrite the stored owner
+        const { ownerId: _ignored, ownerIdLower: _ignored2, ...safeMsg } = msg as Record<string, unknown>;
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
-          if (msg.isPublic === false) {
+          // Preserve ownerId/ownerIdLower from stored record
+          const preservedOwner = { ownerId: sv.ownerId, ownerIdLower: sv.ownerIdLower || (sv.ownerId as string || "").toLowerCase() };
+          if (safeMsg.isPublic === false) {
             publicServers.delete(sid);
-            await kv.set(["servers", sid], { ...sv, ...msg, isPublic: false });
+            await kv.set(["servers", sid], { ...sv, ...safeMsg, ...preservedOwner, isPublic: false });
           } else {
-            const updated = { ...sv, ...msg };
+            const updated = { ...sv, ...safeMsg, ...preservedOwner };
             publicServers.set(sid, updated);
             await kv.set(["servers", sid], updated);
           }
-        } else if (msg.isPublic === true) {
+        } else if (safeMsg.isPublic === true) {
           const base = existing.value || {};
-          const updated = { ...base, id: sid, name: msg.name, desc: msg.desc || "", icon: msg.icon || null, color: msg.color || "#6c63ff", memberCount: msg.memberCount || 1, createdAt: msg.createdAt || Date.now(), channels: msg.channels || [], ownerId: msg.ownerId || senderName, isPublic: true };
+          const preservedOwner = { ownerId: (base.ownerId as string) || senderName, ownerIdLower: (base.ownerIdLower as string) || senderName.toLowerCase() };
+          const updated = { ...base, id: sid, name: safeMsg.name, desc: safeMsg.desc || "", icon: safeMsg.icon || null, color: safeMsg.color || "#6c63ff", memberCount: safeMsg.memberCount || 1, createdAt: safeMsg.createdAt || Date.now(), channels: safeMsg.channels || [], ...preservedOwner, isPublic: true };
           publicServers.set(sid, updated);
           await kv.set(["servers", sid], updated);
         } else if (existing.value) {
-          await kv.set(["servers", sid], { ...existing.value, ...msg });
+          const preservedOwner = { ownerId: existing.value.ownerId, ownerIdLower: existing.value.ownerIdLower || (existing.value.ownerId as string || "").toLowerCase() };
+          await kv.set(["servers", sid], { ...existing.value, ...safeMsg, ...preservedOwner });
         }
-        broadcast(msg, ws);
+        // Broadcast the message with the correct, authoritative ownerId
+        const finalSv = (await kv.get<Record<string, unknown>>(["servers", sid])).value || publicServers.get(sid);
+        broadcast({ ...msg, ownerId: finalSv?.ownerId }, ws);
         break;
       }
 
@@ -714,11 +737,19 @@ Deno.serve((req) => {
         for (const sv of (msg.servers as unknown[] || [])) {
           const s = sv as Record<string, unknown>;
           if (!s.id) continue;
+          // FIX: Check if server already exists - if so, preserve ownerId
+          const existingSv = await kv.get<Record<string, unknown>>(["servers", s.id as string]);
+          const existingOwner = existingSv.value?.ownerId;
+          const existingOwnerLower = existingSv.value?.ownerIdLower || (existingOwner as string || "").toLowerCase();
           const svEntry: Record<string, unknown> = {
             id: s.id, name: s.name, desc: s.desc || "",
             icon: s.icon || null, color: s.color || "#6c63ff",
             memberCount: s.memberCount || 1, createdAt: s.createdAt || Date.now(),
-            channels: s.channels || [], ownerId: s.ownerId || senderName, isPublic: true,
+            channels: s.channels || [],
+            // FIX: preserve stored owner; only set from message if no owner on record
+            ownerId: existingOwner || s.ownerId || senderName,
+            ownerIdLower: existingOwnerLower || (s.ownerId as string || senderName).toLowerCase(),
+            isPublic: true,
           };
           publicServers.set(s.id as string, svEntry);
           await kv.set(["servers", s.id as string], svEntry);
