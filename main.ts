@@ -645,7 +645,12 @@ Deno.serve((req) => {
         const verifyIndex = await kv.get(["user_servers", senderName.toLowerCase()]);
         console.log(`[server_create] user_servers index for ${senderName.toLowerCase()}=${JSON.stringify(verifyIndex.value)}`);
 
-        broadcast(msg, ws);
+        // FIX: Broadcast authoritative svData (with correct ownerId) so other clients
+        // can add the server to their discover list immediately without a get_server_list fetch.
+        broadcast({ type: "server_create", serverId: svData.id, name: svData.name, desc: svData.desc,
+          icon: svData.icon, color: svData.color, memberCount: svData.memberCount,
+          createdAt: svData.createdAt, channels: svData.channels, ownerId: svData.ownerId,
+          isPublic: svData.isPublic }, ws);
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "server_create_ok", serverId: msg.serverId }));
           console.log(`[server_create] ACK sent to ${senderName}`);
