@@ -172,6 +172,14 @@ Deno.serve((req) => {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(e.data as string); } catch { return; }
     console.log(`[recv] type=${msg.type}`);
+    try {
+      await handleMsg(ws, msg);
+    } catch (err) {
+      console.error(`[onmessage] unhandled error type=${msg.type}:`, err);
+    }
+  };
+
+  async function handleMsg(ws: WebSocket, msg: Record<string, unknown>) {
     const info = clientInfo(ws);
 
     // ── AUTH — no token required ──────────────────────────────────────────
@@ -672,9 +680,11 @@ Deno.serve((req) => {
             break;
           }
         }
-        // FIX: Never allow ownerId to be changed via server_update (only explicit transfer logic should do that)
-        // Strip ownerId from the incoming message so it can't overwrite the stored owner
-        const { ownerId: _ignored, ownerIdLower: _ignored2, ...safeMsg } = msg as Record<string, unknown>;
+        // FIX: Never allow ownerId to be changed via server_update
+        // Remove ownerId/ownerIdLower from msg copy so they can't overwrite stored owner
+        const safeMsg = { ...msg as Record<string, unknown> };
+        delete safeMsg.ownerId;
+        delete safeMsg.ownerIdLower;
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
           // Preserve ownerId/ownerIdLower from stored record
@@ -922,7 +932,7 @@ Deno.serve((req) => {
       default:
         console.log("Unknown:", msg.type);
     }
-  };
+  } // end handleMsg
 
   ws.onclose = () => {
     const info = clientInfo(ws);
