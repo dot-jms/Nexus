@@ -417,11 +417,11 @@ Deno.serve((req) => {
     }
 
     // ── Guard: must be identified ─────────────────────────────────────────
-    // FIX: Because we now register the client synchronously at the start of
-    // identify (before awaiting KV), this guard will no longer drop messages
-    // that arrive before identify's async work finishes.
     if (!info) {
-      // Client has a valid token but hasn't sent identify yet
+      // Client has a valid token but hasn't sent identify yet —
+      // however server_create may arrive right after identify before
+      // the async KV lookup completes, so log it clearly
+      console.log(`[guard] dropping msg type=${msg.type} — client not yet identified`);
       return;
     }
 
@@ -570,6 +570,7 @@ Deno.serve((req) => {
       case "channel_delete":
       case "voice_join":
       case "voice_leave":
+      case "join_channel": // client sends this on channel select — just broadcast presence
         broadcast(msg, ws);
         break;
 
