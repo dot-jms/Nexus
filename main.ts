@@ -132,6 +132,12 @@ async function removeServerFromUser(username: string, serverId: string) {
     if (sv && sv.isPublic !== false) publicServers.set(sv.id as string, sv);
   }
   console.log(`Loaded ${publicServers.size} servers from KV`);
+  // Debug: list all KV keys on startup
+  const allKeys: string[] = [];
+  const allIter = kv.list({ prefix: [] });
+  for await (const item of allIter) allKeys.push(JSON.stringify(item.key));
+  console.log(`[startup] KV keys (${allKeys.length} total): ${allKeys.slice(0, 20).join(", ")}`);
+
   const chIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
   for await (const item of chIter) {
     const chId = item.key[1] as string;
@@ -590,6 +596,7 @@ Deno.serve((req) => {
       }
 
       case "server_create": {
+        console.log(`[server_create] RECEIVED from ${senderName} id=${msg.serverId} name=${msg.name}`);
         const svData = {
           id: msg.serverId, name: msg.name, desc: msg.desc || "",
           icon: msg.icon || null, color: msg.color || "#6c63ff",
@@ -599,16 +606,24 @@ Deno.serve((req) => {
         };
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
         await kv.set(["servers", msg.serverId as string], svData);
-        console.log(`[server_create] saved id=${msg.serverId} name=${msg.name} owner=${senderName}`);
 
-        // FIX: Use the addServerToUser helper which always lowercases the key
+        // Verify it actually wrote
+        const verifyWrite = await kv.get(["servers", msg.serverId as string]);
+        console.log(`[server_create] KV write verified=${!!verifyWrite.value} id=${msg.serverId} owner=${senderName}`);
+
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         await addServerToUser(senderName, msg.serverId as string);
 
+        // Verify user_servers index
+        const verifyIndex = await kv.get(["user_servers", senderName.toLowerCase()]);
+        console.log(`[server_create] user_servers index for ${senderName.toLowerCase()}=${JSON.stringify(verifyIndex.value)}`);
+
         broadcast(msg, ws);
-        // ACK back to creator so client knows it was persisted to KV
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "server_create_ok", serverId: msg.serverId }));
+          console.log(`[server_create] ACK sent to ${senderName}`);
+        } else {
+          console.log(`[server_create] WARNING: ws not open (readyState=${ws.readyState}), could not ACK`);
         }
         break;
       }
