@@ -398,6 +398,37 @@ Deno.serve((req) => {
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
 
+      // ── Client-side server recovery ────────────────────────────────────────
+      // If the client sent locally-known servers that aren't in KV (e.g. after a
+      // Deno restart lost the KV write), re-register them now — ownerId is forced
+      // to the verified token user so clients can't hijack each other's servers.
+      if (Array.isArray(msg.localServers) && (msg.localServers as unknown[]).length) {
+        const knownIds = new Set(userServers.map(sv => sv.id as string));
+        for (const clientSv of msg.localServers as Record<string, unknown>[]) {
+          if (!clientSv.id || knownIds.has(clientSv.id as string)) continue;
+          const kvCheck = await kv.get(["servers", clientSv.id as string]);
+          if (!kvCheck.value) {
+            const recovered = {
+              id: clientSv.id, name: clientSv.name || "Unnamed Server",
+              desc: clientSv.desc || "", icon: clientSv.icon || null,
+              color: clientSv.color || "#6c63ff",
+              memberCount: clientSv.memberCount || 1,
+              createdAt: clientSv.createdAt || Date.now(),
+              channels: clientSv.channels || [],
+              ownerId: name, // always force to authenticated user
+              isPublic: clientSv.isPublic !== false,
+            };
+            if (recovered.isPublic) publicServers.set(recovered.id as string, recovered);
+            await kv.set(["servers", recovered.id as string], recovered);
+            await kv.set(["server_member", recovered.id as string, name], { joinedAt: Date.now() });
+            await addServerToUser(tokenUser, recovered.id as string);
+            userServers.push(recovered);
+            knownIds.add(recovered.id as string);
+            console.log(`[identify] recovered lost server "${recovered.name}" (${recovered.id}) for ${name}`);
+          }
+        }
+      }
+
       const friendsList = (await kv.get(["friends", tokenUser])).value || [];
       const pendingReqs: unknown[] = [];
       const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
