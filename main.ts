@@ -2,6 +2,12 @@
 // Server-side auth via Deno KV. Accounts persist across restarts.
 // Puck is the platform admin. Co-admins can be appointed by Puck.
 
+// ─── Deploy version — changes on every new deploy ───────────────────────────
+// Deno Deploy re-runs this file fresh on each deploy, so Date.now() at module
+// load time gives a unique version per deployment automatically.
+const DEPLOY_VERSION = Date.now().toString(36);
+console.log(`[nexus] deploy version: ${DEPLOY_VERSION}`);
+
 // ─── KV setup ───────────────────────────────────────────────────────────────
 const kv = await Deno.openKv();
 
@@ -160,6 +166,20 @@ async function removeServerFromUser(username: string, serverId: string) {
 
 // ─── Main server ────────────────────────────────────────────────────────────
 Deno.serve((req) => {
+  const url = new URL(req.url);
+
+  // ── Version endpoint — client polls this to detect new deploys ──────────
+  if (url.pathname === "/_version") {
+    return new Response(JSON.stringify({ version: DEPLOY_VERSION }), {
+      headers: {
+        "content-type": "application/json",
+        // Never cache this endpoint
+        "cache-control": "no-store, no-cache, must-revalidate",
+        "access-control-allow-origin": "*",
+      },
+    });
+  }
+
   if (req.headers.get("upgrade") !== "websocket") {
     return new Response("Nexus relay running ✓", { status: 200 });
   }
@@ -537,9 +557,21 @@ Deno.serve((req) => {
 
     if (msg.type === "admin_delete_server") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
-      publicServers.delete(msg.serverId as string);
-      await kv.delete(["servers", msg.serverId as string]);
-      broadcast({ type: "server_delete", serverId: msg.serverId, by: senderName });
+      const adminDelId = msg.serverId as string;
+      const adminDelEntry = await kv.get<Record<string, unknown>>(["servers", adminDelId]);
+      publicServers.delete(adminDelId);
+      await kv.delete(["servers", adminDelId]);
+      // Clean up channel history
+      const adminDelChannels = (adminDelEntry.value?.channels as Array<{ id: string }>) || [];
+      for (const ch of adminDelChannels) await kv.delete(["ch_history", ch.id]);
+      // Clean up member indexes
+      const adminDelMemIter = kv.list({ prefix: ["server_member", adminDelId] });
+      for await (const item of adminDelMemIter) {
+        const memberName = item.key[2] as string;
+        await kv.delete(item.key);
+        await removeServerFromUser(memberName, adminDelId);
+      }
+      broadcast({ type: "server_delete", serverId: adminDelId, by: senderName });
       ws.send(JSON.stringify({ type: "success", message: "Server deleted." }));
       return;
     }
@@ -866,16 +898,65 @@ Deno.serve((req) => {
         if (!newName || !/^[a-zA-Z0-9_.\-]{2,24}$/.test(newName)) {
           ws.send(JSON.stringify({ type: "error", message: "Invalid username format." })); break;
         }
-        const targetKey = ["accounts", target.toLowerCase()];
+        const targetLower = target.toLowerCase();
+        const newNameLower = newName.toLowerCase();
+        const targetKey = ["accounts", targetLower];
         const targetEntry = await kv.get<Record<string, unknown>>(targetKey);
         if (!targetEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
-        const newKey = ["accounts", newName.toLowerCase()];
+        const newKey = ["accounts", newNameLower];
         const existingNew = await kv.get(newKey);
         if (existingNew.value) { ws.send(JSON.stringify({ type: "error", message: "That username is already taken." })); break; }
+
+        // 1. Move the account record
         await kv.set(newKey, { ...targetEntry.value as object, name: newName });
         await kv.delete(targetKey);
+
+        // 2. Migrate all session tokens that resolve to the old username → new username
+        const sessionIter = kv.list<string>({ prefix: ["sessions"] });
+        for await (const item of sessionIter) {
+          if (item.value === targetLower) {
+            await kv.set(item.key, newNameLower);
+            sessions.set(item.key[1] as string, newNameLower);
+            console.log(`[rename] migrated session token ${(item.key[1] as string).slice(0, 8)}... → ${newNameLower}`);
+          }
+        }
+        // Also update in-memory sessions map
+        for (const [tok, uname] of sessions) {
+          if (uname === targetLower) sessions.set(tok, newNameLower);
+        }
+
+        // 3. Migrate user_servers index key
+        const oldSvsKey = ["user_servers", targetLower];
+        const oldSvsEntry = await kv.get<string[]>(oldSvsKey);
+        if (oldSvsEntry.value) {
+          await kv.set(["user_servers", newNameLower], oldSvsEntry.value);
+          await kv.delete(oldSvsKey);
+          console.log(`[rename] migrated user_servers index for ${targetLower} → ${newNameLower}`);
+        }
+
+        // 4. Migrate server_member entries — old entries use display name, update to new display name
+        // Also update ownerId on any servers this user owns
+        const svMemberIter = kv.list({ prefix: ["server_member"] });
+        for await (const item of svMemberIter) {
+          const memberName = item.key[2] as string;
+          if (memberName.toLowerCase() === targetLower) {
+            const svId = item.key[1] as string;
+            await kv.set(["server_member", svId, newName], item.value);
+            await kv.delete(item.key);
+            // Update ownerId if this user owns the server
+            const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+            if (svEntry.value && (svEntry.value.ownerId as string || "").toLowerCase() === targetLower) {
+              const updatedSv = { ...svEntry.value, ownerId: newName, ownerIdLower: newNameLower };
+              await kv.set(["servers", svId], updatedSv);
+              if (publicServers.has(svId)) publicServers.set(svId, updatedSv);
+              console.log(`[rename] updated ownerId on server ${svId} → ${newName}`);
+            }
+          }
+        }
+
+        // 5. Update live connected clients
         for (const [cws, ci] of clients) {
-          if ((ci.name as string).toLowerCase() === target.toLowerCase()) {
+          if ((ci.name as string).toLowerCase() === targetLower) {
             (ci as Record<string, unknown>).name = newName;
             cws.send(JSON.stringify({ type: "admin_rename_ok", oldName: target, newName }));
           }
