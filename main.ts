@@ -220,6 +220,22 @@ Deno.serve((req) => {
   ws.onopen = () => console.log("WS connected");
 
   ws.onmessage = async (e) => {
+    // ── Payload size guard ────────────────────────────────────────────────────
+    // A single oversized base64 image message can OOM Deno Deploy's isolate.
+    // Hard limit: 1.5 MB per message (covers a compressed 800px JPEG at ~700 KB
+    // encoded as base64 with ~33% overhead, plus JSON envelope).
+    // Messages over this limit are dropped with an error sent back to the client.
+    const MAX_MSG_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
+    if ((e.data as string).length > MAX_MSG_BYTES) {
+      try {
+        ws.send(JSON.stringify({
+          type: "error",
+          message: `Message too large (${((e.data as string).length / 1024 / 1024).toFixed(1)} MB). Images must be under ~700 KB after compression.`,
+        }));
+      } catch { /* ws might already be closing */ }
+      console.warn(`[size-guard] DROPPED oversized message: ${((e.data as string).length / 1024).toFixed(0)} KB`);
+      return;
+    }
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(e.data as string); } catch { return; }
     console.log(`[recv] type=${msg.type}`);
