@@ -20,7 +20,7 @@ if (!puckEntry.value) {
     tag: "0001",
     color: "#6c63ff",
     pfp: null,
-    passwordHash: hashPw("changeme"),
+    passwordHash: await hashPw("changeme"),
     systemRole: "admin",
     coAdmin: false,
     createdAt: Date.now(),
@@ -29,12 +29,25 @@ if (!puckEntry.value) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-function hashPw(pw: string): string {
+
+// FIX #2: Replaced weak djb2 hash with SHA-256 via Web Crypto.
+// hashPwLegacy kept to transparently migrate existing accounts on next login.
+function hashPwLegacy(pw: string): string {
   let h = 5381;
   for (let i = 0; i < pw.length; i++) {
     h = (((h << 5) + h) + pw.charCodeAt(i)) | 0;
   }
   return (h >>> 0).toString(36);
+}
+
+async function hashPw(pw: string): Promise<string> {
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(pw),
+  );
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function genToken(): string {
@@ -49,6 +62,7 @@ const publicServers = new Map<string, Record<string, unknown>>();
 const msgHistory = new Map<string, unknown[]>();
 const offline = new Map<string, unknown[]>();
 // timed bans: lowercase username → { until: number, reason: string }
+// FIX #3: timedBans is now the in-memory cache; source of truth is KV ["bans", username]
 const timedBans = new Map<string, { until: number; reason: string }>();
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
@@ -101,7 +115,8 @@ async function verifyTokenKv(token: string | undefined): Promise<string | null> 
     if (item.value?.lastToken === token) {
       const username = item.key[1] as string;
       sessions.set(token, username);
-      await kv.set(["sessions", token], username);
+      // FIX #7: Use expireIn here too so recovered tokens don't accumulate indefinitely
+      await kv.set(["sessions", token], username, { expireIn: 30 * 24 * 60 * 60 * 1000 });
       console.log(`[token-recovery] recovered session for ${username}`);
       return username;
     }
@@ -162,6 +177,22 @@ async function removeServerFromUser(username: string, serverId: string) {
     const chId = item.key[1] as string;
     if (item.value?.length) msgHistory.set(chId, item.value);
   }
+
+  // FIX #3: Restore persisted bans. Expired ones are cleaned up here so they
+  // don't accumulate in KV indefinitely.
+  const banIter = kv.list<{ until: number; reason: string }>({ prefix: ["bans"] });
+  for await (const item of banIter) {
+    const username = item.key[1] as string;
+    const ban = item.value;
+    if (!ban) continue;
+    if (ban.until === -1 || Date.now() < ban.until) {
+      timedBans.set(username, ban);
+    } else {
+      // Expired — purge from KV
+      await kv.delete(item.key);
+    }
+  }
+  console.log(`[startup] Loaded ${timedBans.size} active ban(s) from KV`);
 }
 
 // ─── Main server ────────────────────────────────────────────────────────────
@@ -226,7 +257,7 @@ Deno.serve((req) => {
         tag,
         color: msg.color || "#6c63ff",
         pfp: msg.pfp || null,
-        passwordHash: hashPw(password),
+        passwordHash: await hashPw(password),
         systemRole: "user",
         coAdmin: false,
         createdAt: Date.now(),
@@ -234,7 +265,8 @@ Deno.serve((req) => {
       await kv.set(key, acct);
       const token = genToken();
       sessions.set(token, username.toLowerCase());
-      await kv.set(["sessions", token], username.toLowerCase());
+      // FIX #7: Sessions expire after 30 days
+      await kv.set(["sessions", token], username.toLowerCase(), { expireIn: 30 * 24 * 60 * 60 * 1000 });
       console.log(`Registered: ${username}`);
       ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: acct.systemRole, coAdmin: false } }));
       return;
@@ -249,8 +281,20 @@ Deno.serve((req) => {
         ws.send(JSON.stringify({ type: "auth_error", message: "Account not found. Did you mean to register?" })); return;
       }
       const acct = entry.value;
-      if (acct.passwordHash !== hashPw(password)) {
+      // FIX #2: Support both new SHA-256 hash and legacy djb2 hash so existing
+      // users are not locked out. On successful legacy login, silently upgrade.
+      const newHash = await hashPw(password);
+      const legacyHash = hashPwLegacy(password);
+      const validNew    = acct.passwordHash === newHash;
+      const validLegacy = acct.passwordHash === legacyHash;
+      if (!validNew && !validLegacy) {
         ws.send(JSON.stringify({ type: "auth_error", message: "Incorrect password." })); return;
+      }
+      if (validLegacy && !validNew) {
+        // Migrate to SHA-256 hash transparently
+        await kv.set(key, { ...acct, passwordHash: newHash });
+        acct.passwordHash = newHash;
+        console.log(`[auth] migrated password hash for ${username} from legacy to SHA-256`);
       }
       if (isBanned(username)) {
         const ban = timedBans.get(username);
@@ -259,7 +303,8 @@ Deno.serve((req) => {
       }
       const token = genToken();
       sessions.set(token, username);
-      await kv.set(["sessions", token], username);
+      // FIX #7: Sessions expire after 30 days to prevent unbounded KV growth
+      await kv.set(["sessions", token], username, { expireIn: 30 * 24 * 60 * 60 * 1000 });
       console.log(`Login: ${acct.name}`);
       const firstLogin = !acct.hasLoggedIn;
       if (!acct.hasLoggedIn) await kv.set(key, { ...acct, hasLoggedIn: true, lastToken: token });
@@ -289,11 +334,12 @@ Deno.serve((req) => {
       if (existing.value) {
         ws.send(JSON.stringify({ type: "auth_error", message: "That username is already registered. Try logging in, or choose a different username." })); return;
       }
-      const acct = { name: username, tag, color, pfp, passwordHash: hashPw(password), systemRole: "user", coAdmin: false, createdAt: Date.now() };
+      const acct = { name: username, tag, color, pfp, passwordHash: await hashPw(password), systemRole: "user", coAdmin: false, createdAt: Date.now() };
       await kv.set(key, acct);
       const token = genToken();
       sessions.set(token, username.toLowerCase());
-      await kv.set(["sessions", token], username.toLowerCase());
+      // FIX #7: Sessions expire after 30 days
+      await kv.set(["sessions", token], username.toLowerCase(), { expireIn: 30 * 24 * 60 * 60 * 1000 });
       ws.send(JSON.stringify({ type: "auth_ok", token, user: { name: acct.name, tag: acct.tag, color: acct.color, pfp: acct.pfp, systemRole: "user", coAdmin: false }, migrated: true }));
       return;
     }
@@ -316,10 +362,13 @@ Deno.serve((req) => {
       const key = ["accounts", tokenUser];
       const entry = await kv.get<Record<string, unknown>>(key);
       if (!entry.value) { ws.send(JSON.stringify({ type: "error", context: "change_password", message: "Account not found." })); return; }
-      if (entry.value.passwordHash !== hashPw(oldPassword)) {
+      // FIX #2: Support both new SHA-256 and legacy djb2 for old-password verification
+      const oldHashNew    = await hashPw(oldPassword);
+      const oldHashLegacy = hashPwLegacy(oldPassword);
+      if (entry.value.passwordHash !== oldHashNew && entry.value.passwordHash !== oldHashLegacy) {
         ws.send(JSON.stringify({ type: "error", context: "change_password", message: "Current password is incorrect." })); return;
       }
-      await kv.set(key, { ...entry.value, passwordHash: hashPw(newPassword) });
+      await kv.set(key, { ...entry.value, passwordHash: await hashPw(newPassword) });
       ws.send(JSON.stringify({ type: "success", message: "Password changed!" }));
       return;
     }
@@ -357,7 +406,8 @@ Deno.serve((req) => {
       // Re-persist the session token in case KV was wiped (e.g. new database attached)
       // This means the next message with this token will verify correctly
       sessions.set(msg.token as string, tokenUser);
-      await kv.set(["sessions", msg.token as string], tokenUser);
+      // FIX #7: Refresh expiry on every identify (keeps active sessions alive)
+      await kv.set(["sessions", msg.token as string], tokenUser, { expireIn: 30 * 24 * 60 * 60 * 1000 });
       console.log(`[identify] re-persisted session token for ${name}`);
 
       // FIX: Look up user_servers by lowercased token user (consistent key)
@@ -518,6 +568,8 @@ Deno.serve((req) => {
         until = Date.now() + ms;
       }
       timedBans.set(target, { until, reason: msg.reason as string || "No reason given" });
+      // FIX #3: Persist ban to KV so it survives server restarts
+      await kv.set(["bans", target], { until, reason: msg.reason as string || "No reason given" });
       for (const [cws, ci] of clients) {
         if ((ci.name as string).toLowerCase() === target) {
           cws.send(JSON.stringify({ type: "banned", until, reason: msg.reason || "No reason given" }));
@@ -532,7 +584,10 @@ Deno.serve((req) => {
 
     if (msg.type === "admin_unban") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
-      timedBans.delete((msg.target as string || "").toLowerCase());
+      const unbanTarget = (msg.target as string || "").toLowerCase();
+      timedBans.delete(unbanTarget);
+      // FIX #3: Remove from KV as well
+      await kv.delete(["bans", unbanTarget]);
       ws.send(JSON.stringify({ type: "success", message: `${msg.target} unbanned.` }));
       return;
     }
@@ -748,6 +803,16 @@ Deno.serve((req) => {
       case "server_delete": {
         const delSvId = msg.serverId as string;
         const delSvEntry = await kv.get<Record<string, unknown>>(["servers", delSvId]);
+        // FIX #1: Verify the sender is the server owner or a platform admin/co-admin
+        const delSvOwnerLower = (
+          (delSvEntry.value?.ownerIdLower as string) ||
+          (delSvEntry.value?.ownerId as string || "").toLowerCase()
+        );
+        if (delSvOwnerLower && delSvOwnerLower !== senderName.toLowerCase() && !isPowerUser) {
+          console.log(`[server_delete] BLOCKED: ${senderName} tried to delete server ${delSvId} owned by ${delSvEntry.value?.ownerId}`);
+          ws.send(JSON.stringify({ type: "error", message: "Only the server owner can delete this server." }));
+          break;
+        }
         publicServers.delete(delSvId);
         await kv.delete(["servers", delSvId]);
         const delChannels = (delSvEntry.value?.channels as Array<{ id: string }>) || [];
@@ -764,6 +829,17 @@ Deno.serve((req) => {
       }
 
       case "leave_server": {
+        // FIX #6: Prevent the owner from leaving — orphaned ownerless servers can
+        // never be managed or deleted by anyone. Owner must delete the server instead.
+        const leaveSvEntry = await kv.get<Record<string, unknown>>(["servers", msg.serverId as string]);
+        const leaveSvOwnerLower = (
+          (leaveSvEntry.value?.ownerIdLower as string) ||
+          (leaveSvEntry.value?.ownerId as string || "").toLowerCase()
+        );
+        if (leaveSvOwnerLower && leaveSvOwnerLower === senderName.toLowerCase()) {
+          ws.send(JSON.stringify({ type: "error", message: "You own this server. Transfer ownership or delete it before leaving." }));
+          break;
+        }
         await kv.delete(["server_member", msg.serverId as string, senderName]);
         await removeServerFromUser(senderName, msg.serverId as string);
         broadcast(msg, ws);
@@ -781,6 +857,7 @@ Deno.serve((req) => {
       }
 
       case "announce_servers":
+        // FIX #4: Only allow announcing servers the sender actually owns (or power users)
         for (const sv of (msg.servers as unknown[] || [])) {
           const s = sv as Record<string, unknown>;
           if (!s.id) continue;
@@ -788,6 +865,11 @@ Deno.serve((req) => {
           const existingSv = await kv.get<Record<string, unknown>>(["servers", s.id as string]);
           const existingOwner = existingSv.value?.ownerId;
           const existingOwnerLower = existingSv.value?.ownerIdLower || (existingOwner as string || "").toLowerCase();
+          // If a stored owner exists and doesn't match the sender, skip unless power user
+          if (existingOwnerLower && existingOwnerLower !== senderName.toLowerCase() && !isPowerUser) {
+            console.log(`[announce_servers] BLOCKED: ${senderName} tried to announce server ${s.id} owned by ${existingOwner}`);
+            continue;
+          }
           const svEntry: Record<string, unknown> = {
             id: s.id, name: s.name, desc: s.desc || "",
             icon: s.icon || null, color: s.color || "#6c63ff",
@@ -825,7 +907,8 @@ Deno.serve((req) => {
 
       case "fetch_dm_history": {
         const withUser = msg.with as string;
-        const dmKey = ["dm_history", [senderName, withUser].sort().join(":")];
+        // FIX #8: Lowercase-normalize key to match how dm messages are stored
+        const dmKey = ["dm_history", [senderName.toLowerCase(), withUser.toLowerCase()].sort().join(":")];
         const entry = await kv.get<unknown[]>(dmKey);
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "dm_history", with: withUser, messages: entry.value || [] }));
         break;
@@ -860,7 +943,9 @@ Deno.serve((req) => {
       case "dm": {
         const dmTo = msg.to as string;
         const dmFrom = msg.from as string;
-        const dmKey = ["dm_history", [dmFrom, dmTo].sort().join(":")];
+        // FIX #8: Normalize both sides to lowercase so case-variant names (e.g. after
+        // an admin rename) always resolve to the same KV key.
+        const dmKey = ["dm_history", [dmFrom.toLowerCase(), dmTo.toLowerCase()].sort().join(":")];
         const existing = await kv.get<unknown[]>(dmKey);
         const hist = existing.value || [];
         hist.push({ ...msg, _stored: Date.now() });
@@ -887,6 +972,12 @@ Deno.serve((req) => {
         break;
 
       case "admin_dm_response": {
+        // FIX #5: Only power users should be able to submit DM responses — a regular
+        // user crafting a fake admin_dm_response could spam or spoof the admin panel.
+        if (!isPowerUser) {
+          console.log(`[admin_dm_response] BLOCKED from non-admin sender ${senderName}`);
+          break;
+        }
         sendToUser(msg.requestedBy as string, { type: "admin_dm_data", target: senderName, dms: msg.dms }, false);
         break;
       }
