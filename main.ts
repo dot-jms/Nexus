@@ -73,6 +73,10 @@ const channelLocks = new Map<string, { locked: boolean; by: string }>();
 const slowmodes = new Map<string, number>();
 // per-user last-post timestamp for slowmode enforcement: "chId:username" → timestamp
 const slowmodeLastPost = new Map<string, number>();
+// active DM voice calls: callId → { participants: Set<string>, startedAt: number }
+const activeCalls = new Map<string, { participants: Set<string>; startedAt: number }>();
+// ghost call watchers: callId → admin username (only one ghost per call for simplicity)
+const ghostCalls = new Map<string, string>();
 // platform maintenance mode — only admins can connect/identify when true
 let maintenanceMode = false;
 // audit log ring buffer (last 500 admin actions, also persisted to KV)
@@ -565,7 +569,8 @@ Deno.serve((req) => {
             name: acct?.name || tokenUser,
             tag: acct?.tag || "0000",
             color: acct?.color || "#6c63ff",
-            pfp: null,
+            // pfp intentionally omitted — sent separately via user_pfp so it
+            // never overwrites a valid cached pfp with null on reconnect.
             systemRole: acct?.systemRole || "user",
             coAdmin: acct?.coAdmin || false,
             bio: acct?.bio || "",
@@ -573,9 +578,9 @@ Deno.serve((req) => {
           },
           servers: userServers,
         }));
-        if (acct?.pfp) {
-          ws.send(JSON.stringify({ type: "user_pfp", pfp: acct.pfp }));
-        }
+        // Always send pfp state: send null explicitly if the user has none,
+        // so the client can clear a stale cached pfp after an admin wipe.
+        ws.send(JSON.stringify({ type: "user_pfp", pfp: acct?.pfp || null }));
         if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
           ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
         }
@@ -798,10 +803,44 @@ Deno.serve((req) => {
       case "roles_update":
       case "channel_delete":
       case "voice_join":
+        if (info) (info as Record<string,unknown>).vcChannelId = (msg.channelId as string || null);
+        broadcast(msg, ws);
+        break;
       case "voice_leave":
+        if (info) (info as Record<string,unknown>).vcChannelId = null;
+        broadcast(msg, ws);
+        break;
       case "join_channel": // client sends this on channel select — just broadcast presence
         broadcast(msg, ws);
         break;
+
+      case "voice_ghost_join": {
+        // Admin silently joins a voice channel — NOT broadcast to other members.
+        // Server remembers they're in the channel for signal routing only.
+        // No sound, no name shown, until they choose to unmute/reveal.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        // Ack back to admin only — includes current members in that channel
+        const ghostChId = (msg.channelId as string || "").trim();
+        const currentMembers: string[] = [];
+        for (const [, ci] of clients) {
+          // We track voice channel membership via in-memory client info
+          if ((ci as Record<string,unknown>).vcChannelId === ghostChId && ci.name !== senderName) {
+            currentMembers.push(ci.name as string);
+          }
+        }
+        // Tag this client as ghost-listening to this channel
+        if (info) (info as Record<string,unknown>).vcChannelId = ghostChId;
+        ws.send(JSON.stringify({ type: "voice_ghost_ack", channelId: ghostChId, members: currentMembers }));
+        break;
+      }
+
+      case "voice_reveal": {
+        // Admin reveals themselves — broadcast as a normal voice_join from here
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const revealChId = (msg.channelId as string || "").trim();
+        broadcast({ type: "voice_join", channelId: revealChId, user: senderName, serverId: msg.serverId }, null);
+        break;
+      }
 
       case "voice_signal": {
         const target = msg.to as string;
@@ -813,15 +852,92 @@ Deno.serve((req) => {
         break;
       }
 
-      case "vcall_invite":
-      case "vcall_accept":
+      case "vcall_invite": {
+        // Track the call so admins can list/join it
+        const inviteCallId = msg.callId as string;
+        if (inviteCallId) {
+          if (!activeCalls.has(inviteCallId)) {
+            activeCalls.set(inviteCallId, { participants: new Set([senderName]), startedAt: Date.now() });
+          }
+          activeCalls.get(inviteCallId)!.participants.add(senderName);
+        }
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+      case "vcall_accept": {
+        const acceptCallId = msg.callId as string;
+        if (acceptCallId && activeCalls.has(acceptCallId)) {
+          activeCalls.get(acceptCallId)!.participants.add(senderName);
+        }
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
       case "vcall_decline":
       case "vcall_signal": {
         sendToUser(msg.to as string, msg, true);
         break;
       }
       case "vcall_end": {
+        // Remove from active calls
+        const endCallId = msg.callId as string;
+        if (endCallId) activeCalls.delete(endCallId);
         broadcast(msg, ws);
+        break;
+      }
+
+      case "admin_list_calls": {
+        // Return all currently tracked active calls
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const callList: Record<string, unknown>[] = [];
+        for (const [callId, call] of activeCalls) {
+          callList.push({ callId, participants: [...call.participants], startedAt: call.startedAt });
+        }
+        ws.send(JSON.stringify({ type: "admin_calls_list", calls: callList }));
+        break;
+      }
+
+      case "admin_vcall_ghost_join": {
+        // Admin silently injects into an existing call.
+        // Strategy: the server forges a vcall_accept from the ghost to each participant,
+        // then forwards all future vcall_signal messages for this callId to/from the admin.
+        // The admin starts muted — they can reveal themselves later via admin_vcall_ghost_reveal.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const ghostCallId = msg.callId as string;
+        if (!ghostCallId || !activeCalls.has(ghostCallId)) {
+          ws.send(JSON.stringify({ type: "error", message: "Call not found or already ended." })); break;
+        }
+        const call = activeCalls.get(ghostCallId)!;
+        call.participants.add(senderName);
+        // Register admin as ghost (hidden) in this call
+        ghostCalls.set(ghostCallId, senderName);
+        // Ack to admin with participant list so they can initiate WebRTC with each
+        ws.send(JSON.stringify({
+          type: "vcall_ghost_ack",
+          callId: ghostCallId,
+          participants: [...call.participants].filter(p => p !== senderName),
+        }));
+        break;
+      }
+
+      case "admin_vcall_ghost_reveal": {
+        // Admin unmutes/reveals — broadcast a vcall_accept from them to all participants
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const revealCallId = msg.callId as string;
+        if (!revealCallId || !activeCalls.has(revealCallId)) break;
+        ghostCalls.delete(revealCallId);
+        const revealCall = activeCalls.get(revealCallId)!;
+        // Tell all participants that admin joined
+        for (const participant of revealCall.participants) {
+          if (participant === senderName) continue;
+          sendToUser(participant, {
+            type: "vcall_accept",
+            callId: revealCallId,
+            from: senderName,
+            to: participant,
+            fromColor: info?.color || "#6c63ff",
+            fromPfp: info?.pfp || null,
+          }, false);
+        }
         break;
       }
 
@@ -1213,6 +1329,8 @@ Deno.serve((req) => {
             pfp: a.pfp || null, systemRole: a.systemRole || "user",
             coAdmin: a.coAdmin || false, createdAt: a.createdAt || 0,
             bio: a.bio || "",
+            frozen: frozenUsers.has((a.name as string)?.toLowerCase()),
+            online: [...clients.values()].some(ci => (ci.name as string)?.toLowerCase() === (a.name as string)?.toLowerCase()),
           });
         }
         allAccounts.sort((a, b) => ((a.createdAt as number) || 0) - ((b.createdAt as number) || 0));
@@ -2072,6 +2190,16 @@ Deno.serve((req) => {
     if (info) {
       broadcast({ type: "member_leave", user: info.name, serverId: "__all__" });
       console.log("Disconnected:", info.name);
+      // Remove from any active calls
+      const userName = info.name as string;
+      for (const [callId, call] of activeCalls) {
+        call.participants.delete(userName);
+        if (call.participants.size === 0) activeCalls.delete(callId);
+      }
+      // Remove any ghost call they were running
+      for (const [callId, ghostUser] of ghostCalls) {
+        if (ghostUser === userName) ghostCalls.delete(callId);
+      }
     }
     clients.delete(ws);
   };
