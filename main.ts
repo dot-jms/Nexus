@@ -82,6 +82,19 @@ let maintenanceMode = false;
 // audit log ring buffer (last 500 admin actions, also persisted to KV)
 const AUDIT_LIMIT = 500;
 
+// ─── Stale call cleanup — runs every 60s, removes calls where no participants are online ─
+setInterval(() => {
+  const onlineNames = new Set<string>();
+  for (const [, ci] of clients) { if (ci.name) onlineNames.add(ci.name as string); }
+  for (const [callId, call] of activeCalls) {
+    const anyOnline = [...call.participants].some(p => onlineNames.has(p));
+    if (!anyOnline) {
+      activeCalls.delete(callId);
+      ghostCalls.delete(callId);
+    }
+  }
+}, 60_000);
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 function broadcast(data: unknown, exclude: WebSocket | null = null) {
   const msg = JSON.stringify(data);
@@ -770,9 +783,28 @@ Deno.serve((req) => {
         const chKey = ["ch_history", msg.channelId as string];
         const chEntry = await kv.get<unknown[]>(chKey);
         const chHist = chEntry.value || [];
-        chHist.push(msg);
+        // Strip base64 image/video/audio data before persisting to KV to avoid the 65536-byte
+        // per-value limit. Attachments with data URLs are trimmed to a placeholder.
+        const msgToStore = { ...(msg as Record<string,unknown>) };
+        if (Array.isArray(msgToStore.attachments)) {
+          msgToStore.attachments = (msgToStore.attachments as Record<string,unknown>[]).map(att => {
+            const url = att.url as string || "";
+            if (url.startsWith("data:")) {
+              // Keep metadata but drop the binary data — clients who loaded the message keep it cached
+              return { ...att, url: "", _stripped: true };
+            }
+            return att;
+          });
+        }
+        chHist.push(msgToStore);
         if (chHist.length > 500) chHist.splice(0, chHist.length - 500);
-        await kv.set(chKey, chHist);
+        try {
+          await kv.set(chKey, chHist);
+        } catch(e) {
+          // If history is still too large, trim aggressively and retry
+          const trimmed = chHist.slice(-100);
+          try { await kv.set(chKey, trimmed); } catch(_) {}
+        }
         storeMessage(msg.channelId as string, msg);
         broadcast(msg, ws);
         break;
@@ -791,17 +823,128 @@ Deno.serve((req) => {
       }
 
       case "typing":
-      case "delete_message":
-      case "edit_message":
-      case "reaction":
       case "member_join":
       case "member_leave":
       case "kick_member":
-      case "role_assign":
       case "status_update":
       case "pin_message":
-      case "roles_update":
       case "channel_delete":
+        broadcast(msg, ws);
+        break;
+
+      case "video_request": {
+        // Broadcast to all channel members — anyone who has this video cached will respond
+        broadcast(msg, ws);
+        break;
+      }
+      case "video_serve": {
+        // Route directly to the requester (large payload, don't broadcast)
+        sendToUser(msg.to as string, msg, false);
+        break;
+      }
+
+      case "reaction": {
+        // Persist reaction to KV history
+        const rxChId = msg.channelId as string;
+        const rxKey = ["ch_history", rxChId];
+        const rxEntry = await kv.get<unknown[]>(rxKey);
+        if (rxEntry.value) {
+          const rxHist = rxEntry.value as Record<string,unknown>[];
+          const rxMsg = rxHist.find((m: Record<string,unknown>) => m.id === msg.messageId);
+          if (rxMsg) {
+            const reacts = (rxMsg.reactions as Record<string,unknown>[] || []);
+            let r = reacts.find((x: Record<string,unknown>) => x.emoji === msg.emoji) as Record<string,unknown>;
+            if (r) {
+              const users = (r.users as string[] || []);
+              if (users.includes(msg.user as string)) {
+                r.count = (r.count as number) - 1;
+                r.users = users.filter(u => u !== msg.user);
+                if ((r.count as number) <= 0) rxMsg.reactions = reacts.filter((x: Record<string,unknown>) => x.emoji !== msg.emoji);
+              } else { r.count = (r.count as number) + 1; r.users = [...users, msg.user as string]; }
+            } else {
+              reacts.push({ emoji: msg.emoji, count: 1, users: [msg.user] });
+              rxMsg.reactions = reacts;
+            }
+            await kv.set(rxKey, rxHist);
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "delete_message": {
+        // Remove from KV history so it's gone after reload
+        const delChId = msg.channelId as string;
+        const delMsgId = msg.messageId as string;
+        const delKey = ["ch_history", delChId];
+        const delEntry = await kv.get<unknown[]>(delKey);
+        if (delEntry.value) {
+          const filtered = delEntry.value.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId);
+          await kv.set(delKey, filtered);
+        }
+        // Also remove from in-memory cache
+        const delMem = msgHistory.get(delChId);
+        if (delMem) msgHistory.set(delChId, delMem.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId));
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "edit_message": {
+        // Persist edit to KV history
+        const editChId = msg.channelId as string;
+        const editMsgId = msg.messageId as string;
+        const editKey = ["ch_history", editChId];
+        const editEntry = await kv.get<unknown[]>(editKey);
+        if (editEntry.value) {
+          const editHist = editEntry.value as Record<string,unknown>[];
+          const editMsg = editHist.find((m: Record<string,unknown>) => m.id === editMsgId);
+          if (editMsg && editMsg.author === senderName) {
+            editMsg.text = (msg.text as string || "").slice(0, 4000);
+            editMsg.edited = true;
+            await kv.set(editKey, editHist);
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "roles_update": {
+        // Persist custom roles to server record
+        const ruSvId = msg.serverId as string;
+        const ruKey = ["servers", ruSvId];
+        const ruEntry = await kv.get<Record<string,unknown>>(ruKey);
+        if (ruEntry.value) {
+          const stored = ruEntry.value;
+          const storedOwnerLower = (stored.ownerIdLower as string || (stored.ownerId as string || "").toLowerCase());
+          if (storedOwnerLower === senderName.toLowerCase() || isAdmin || isCoAdmin) {
+            await kv.set(ruKey, { ...stored, roles: msg.roles });
+            if (publicServers.has(ruSvId)) publicServers.get(ruSvId)!.roles = msg.roles;
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "role_assign": {
+        // Persist role assignment to server record
+        const raSvId = msg.serverId as string;
+        const raKey = ["servers", raSvId];
+        const raEntry = await kv.get<Record<string,unknown>>(raKey);
+        if (raEntry.value) {
+          const stored = raEntry.value;
+          const memberRoles = (stored.memberRoles as Record<string,string> || {});
+          if (msg.role === 'member' || !msg.role) {
+            delete memberRoles[msg.target as string];
+          } else {
+            memberRoles[msg.target as string] = msg.role as string;
+          }
+          await kv.set(raKey, { ...stored, memberRoles });
+          if (publicServers.has(raSvId)) publicServers.get(raSvId)!.memberRoles = memberRoles;
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
       case "voice_join":
         if (info) (info as Record<string,unknown>).vcChannelId = (msg.channelId as string || null);
         broadcast(msg, ws);
@@ -878,10 +1021,25 @@ Deno.serve((req) => {
         break;
       }
       case "vcall_end": {
-        // Remove from active calls
+        // Route end signal only to call participants, not the whole server
         const endCallId = msg.callId as string;
-        if (endCallId) activeCalls.delete(endCallId);
-        broadcast(msg, ws);
+        if (endCallId && activeCalls.has(endCallId)) {
+          const endCall = activeCalls.get(endCallId)!;
+          for (const participant of endCall.participants) {
+            if (participant !== senderName) {
+              sendToUser(participant, msg, false);
+            }
+          }
+          activeCalls.delete(endCallId);
+          ghostCalls.delete(endCallId);
+        } else {
+          // Fallback: if call wasn't tracked, send to explicit `to` list if provided
+          if (Array.isArray(msg.to)) {
+            for (const target of msg.to as string[]) {
+              sendToUser(target, msg, false);
+            }
+          }
+        }
         break;
       }
 
