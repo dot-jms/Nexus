@@ -64,6 +64,19 @@ const offline = new Map<string, unknown[]>();
 // timed bans: lowercase username → { until: number, reason: string }
 // FIX #3: timedBans is now the in-memory cache; source of truth is KV ["bans", username]
 const timedBans = new Map<string, { until: number; reason: string }>();
+// frozen users: lowercase username → { reason: string, by: string, at: number }
+// Frozen users can connect and read but cannot send messages anywhere
+const frozenUsers = new Map<string, { reason: string; by: string; at: number }>();
+// channel locks cache: channelId → { locked: boolean, by: string }
+const channelLocks = new Map<string, { locked: boolean; by: string }>();
+// per-channel slowmode: channelId → seconds between posts
+const slowmodes = new Map<string, number>();
+// per-user last-post timestamp for slowmode enforcement: "chId:username" → timestamp
+const slowmodeLastPost = new Map<string, number>();
+// platform maintenance mode — only admins can connect/identify when true
+let maintenanceMode = false;
+// audit log ring buffer (last 500 admin actions, also persisted to KV)
+const AUDIT_LIMIT = 500;
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 function broadcast(data: unknown, exclude: WebSocket | null = null) {
@@ -95,6 +108,15 @@ function storeMessage(channelId: string, msg: unknown) {
   const hist = msgHistory.get(channelId)!;
   hist.push(msg);
   if (hist.length > 100) hist.splice(0, hist.length - 100);
+}
+
+// Write an audit log entry. Persisted to KV with a timestamp-based key so
+// they're naturally ordered and queryable by range. Capped at AUDIT_LIMIT.
+async function auditLog(action: string, by: string, details: Record<string, unknown> = {}) {
+  const entry = { action, by, at: Date.now(), ...details };
+  const key = ["audit", Date.now(), Math.random().toString(36).slice(2, 8)];
+  await kv.set(key, entry);
+  console.log(`[audit] ${by} → ${action}`, details);
 }
 
 // Verify token → returns lowercase username or null
@@ -193,6 +215,34 @@ async function removeServerFromUser(username: string, serverId: string) {
     }
   }
   console.log(`[startup] Loaded ${timedBans.size} active ban(s) from KV`);
+
+  // Load frozen users from KV
+  const freezeIter = kv.list<{ reason: string; by: string; at: number }>({ prefix: ["frozen"] });
+  for await (const item of freezeIter) {
+    frozenUsers.set(item.key[1] as string, item.value);
+  }
+  console.log(`[startup] Loaded ${frozenUsers.size} frozen user(s) from KV`);
+
+  // Load channel locks into memory
+  const lockIter = kv.list<{ locked: boolean; by: string }>({ prefix: ["channel_lock"] });
+  for await (const item of lockIter) {
+    channelLocks.set(item.key[1] as string, item.value);
+  }
+  console.log(`[startup] Loaded ${channelLocks.size} channel lock(s) from KV`);
+
+  // Load slowmodes
+  const slowIter = kv.list<number>({ prefix: ["slowmode"] });
+  for await (const item of slowIter) {
+    slowmodes.set(item.key[1] as string, item.value);
+  }
+  console.log(`[startup] Loaded ${slowmodes.size} slowmode(s) from KV`);
+
+  // Load maintenance mode
+  const maintEntry = await kv.get<boolean>(["platform", "maintenance"]);
+  if (maintEntry.value) {
+    maintenanceMode = true;
+    console.log("[startup] ⚠️  MAINTENANCE MODE is active");
+  }
 }
 
 // ─── Main server ────────────────────────────────────────────────────────────
@@ -392,6 +442,17 @@ Deno.serve((req) => {
     // ── identify ──────────────────────────────────────────────────────────
     if (msg.type === "identify") {
       const key = ["accounts", tokenUser];
+
+      // Maintenance mode: only admins can identify
+      if (maintenanceMode) {
+        const maintAcct = await kv.get<Record<string, unknown>>(key);
+        if (maintAcct.value?.systemRole !== "admin") {
+          ws.send(JSON.stringify({ type: "maintenance", message: "Nexus is currently undergoing maintenance. Please try again soon." }));
+          ws.close(1000, "Maintenance");
+          return;
+        }
+      }
+
       // Register client immediately (synchronously) so subsequent messages aren't
       // dropped by the !info guard while we await KV reads below.
       clients.set(ws, {
@@ -518,6 +579,16 @@ Deno.serve((req) => {
         if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
           ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
         }
+        // Send MOTD if set
+        const motdEntry = await kv.get<{ text: string; by: string; at: number }>(["platform", "motd"]);
+        if (motdEntry.value?.text) {
+          ws.send(JSON.stringify({ type: "motd_update", text: motdEntry.value.text, by: motdEntry.value.by }));
+        }
+        // Notify user if their account is frozen
+        if (frozenUsers.has(tokenUser)) {
+          const fz = frozenUsers.get(tokenUser)!;
+          ws.send(JSON.stringify({ type: "account_frozen", reason: fz.reason, by: fz.by }));
+        }
       }
 
       // Flush queued offline messages
@@ -594,6 +665,7 @@ Deno.serve((req) => {
       }
       const untilStr = until === -1 ? "permanently" : `until ${new Date(until).toLocaleString()}`;
       broadcast({ type: "admin_action", action: "ban", target: targetEntry.value.name, by: senderName, reason: msg.reason || "" });
+      await auditLog("ban", senderName, { target, until, reason: msg.reason || "" });
       ws.send(JSON.stringify({ type: "success", message: `${targetEntry.value.name} banned ${untilStr}.` }));
       return;
     }
@@ -665,6 +737,31 @@ Deno.serve((req) => {
 
     switch (msg.type) {
       case "message": {
+        // Check if channel is locked — only power users can post in locked channels
+        const lockState = channelLocks.get(msg.channelId as string);
+        if (lockState?.locked && !isPowerUser) {
+          ws.send(JSON.stringify({ type: "error", message: "This channel is locked by an admin." }));
+          break;
+        }
+        // Check if user is frozen — frozen users cannot send messages
+        if (frozenUsers.has(senderName.toLowerCase())) {
+          const freeze = frozenUsers.get(senderName.toLowerCase())!;
+          ws.send(JSON.stringify({ type: "error", message: `Your account is frozen: ${freeze.reason}` }));
+          break;
+        }
+        // Slowmode check
+        const slowSecs = slowmodes.get(msg.channelId as string) || 0;
+        if (slowSecs > 0 && !isPowerUser) {
+          const slowKey = `${msg.channelId}:${senderName.toLowerCase()}`;
+          const lastPost = slowmodeLastPost.get(slowKey) || 0;
+          const elapsed = (Date.now() - lastPost) / 1000;
+          if (elapsed < slowSecs) {
+            const wait = Math.ceil(slowSecs - elapsed);
+            ws.send(JSON.stringify({ type: "error", message: `Slowmode: wait ${wait}s before sending again.` }));
+            break;
+          }
+          slowmodeLastPost.set(slowKey, Date.now());
+        }
         const chKey = ["ch_history", msg.channelId as string];
         const chEntry = await kv.get<unknown[]>(chKey);
         const chHist = chEntry.value || [];
@@ -957,6 +1054,12 @@ Deno.serve((req) => {
       }
 
       case "dm": {
+        // Frozen users can't send DMs either
+        if (frozenUsers.has(senderName.toLowerCase())) {
+          const freeze = frozenUsers.get(senderName.toLowerCase())!;
+          ws.send(JSON.stringify({ type: "error", message: `Your account is frozen: ${freeze.reason}` }));
+          break;
+        }
         const dmTo = msg.to as string;
         const dmFrom = msg.from as string;
         // FIX #8: Normalize both sides to lowercase so case-variant names (e.g. after
@@ -1114,6 +1217,848 @@ Deno.serve((req) => {
         }
         allAccounts.sort((a, b) => ((a.createdAt as number) || 0) - ((b.createdAt as number) || 0));
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "admin_accounts_list", accounts: allAccounts }));
+        break;
+      }
+
+      case "admin_reset_password": {
+        // Force-set any user's password. Admin only.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can reset passwords." })); break; }
+        const rpTarget = (msg.target as string || "").trim().toLowerCase();
+        const rpNewPw  = (msg.newPassword as string || "").trim();
+        if (!rpTarget || !rpNewPw || rpNewPw.length < 4) {
+          ws.send(JSON.stringify({ type: "error", message: "Target username and new password (min 4 chars) required." })); break;
+        }
+        const rpKey   = ["accounts", rpTarget];
+        const rpEntry = await kv.get<Record<string, unknown>>(rpKey);
+        if (!rpEntry.value) { ws.send(JSON.stringify({ type: "error", message: `User '${rpTarget}' not found.` })); break; }
+        await kv.set(rpKey, { ...rpEntry.value, passwordHash: await hashPw(rpNewPw) });
+        ws.send(JSON.stringify({ type: "success", message: `Password reset for ${rpEntry.value.name}.` }));
+        console.log(`[admin] ${senderName} reset password for ${rpTarget}`);
+        break;
+      }
+
+      case "admin_set_color": {
+        // Change any user's display color. Admin only.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can change user colors." })); break; }
+        const scTarget = (msg.target as string || "").trim().toLowerCase();
+        const scColor  = (msg.color  as string || "").trim();
+        if (!scTarget || !/^#[0-9a-fA-F]{6}$/.test(scColor)) {
+          ws.send(JSON.stringify({ type: "error", message: "Valid target and hex color required." })); break;
+        }
+        const scKey   = ["accounts", scTarget];
+        const scEntry = await kv.get<Record<string, unknown>>(scKey);
+        if (!scEntry.value) { ws.send(JSON.stringify({ type: "error", message: `User '${scTarget}' not found.` })); break; }
+        await kv.set(scKey, { ...scEntry.value, color: scColor });
+        // Update live client map
+        for (const [, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === scTarget) (ci as Record<string, unknown>).color = scColor;
+        }
+        broadcast({ type: "profile_update", user: scEntry.value.name, color: scColor, pfp: scEntry.value.pfp }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Color updated for ${scEntry.value.name}.` }));
+        break;
+      }
+
+      case "admin_kick_from_server": {
+        // Remove a user from any server without banning from the platform.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const kickTarget = (msg.target as string || "").trim();
+        const kickSvId   = (msg.serverId as string || "").trim();
+        if (!kickTarget || !kickSvId) { ws.send(JSON.stringify({ type: "error", message: "Target and serverId required." })); break; }
+        await kv.delete(["server_member", kickSvId, kickTarget]);
+        await removeServerFromUser(kickTarget, kickSvId);
+        // Force-update in-memory client if they're online
+        sendToUser(kickTarget, { type: "kicked_from_server", serverId: kickSvId, by: senderName }, false);
+        broadcast({ type: "member_leave", serverId: kickSvId, user: kickTarget }, null);
+        ws.send(JSON.stringify({ type: "success", message: `${kickTarget} removed from server.` }));
+        console.log(`[admin] ${senderName} kicked ${kickTarget} from server ${kickSvId}`);
+        break;
+      }
+
+      case "admin_purge_user_messages": {
+        // Delete all messages by a specific user across all channels in a server.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const purgeTarget = (msg.target as string || "").trim();
+        const purgeSvId   = (msg.serverId as string || "").trim();
+        if (!purgeTarget || !purgeSvId) { ws.send(JSON.stringify({ type: "error", message: "Target and serverId required." })); break; }
+        const svForPurge  = await kv.get<Record<string, unknown>>(["servers", purgeSvId]);
+        const channels    = (svForPurge.value?.channels as Array<{ id: string }>) || [];
+        let totalDeleted  = 0;
+        for (const ch of channels) {
+          const histKey  = ["ch_history", ch.id];
+          const histEntry = await kv.get<unknown[]>(histKey);
+          if (!histEntry.value?.length) continue;
+          const filtered = histEntry.value.filter((m: unknown) =>
+            (m as Record<string, unknown>).author !== purgeTarget
+          );
+          totalDeleted += histEntry.value.length - filtered.length;
+          await kv.set(histKey, filtered);
+          msgHistory.set(ch.id, filtered);
+        }
+        broadcast({ type: "admin_purge", target: purgeTarget, serverId: purgeSvId, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Deleted ${totalDeleted} message(s) from ${purgeTarget} in server.` }));
+        console.log(`[admin] ${senderName} purged ${totalDeleted} msgs from ${purgeTarget} in server ${purgeSvId}`);
+        break;
+      }
+
+      case "admin_wipe_channel": {
+        // Nuke an entire channel's message history.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const wipeCh = (msg.channelId as string || "").trim();
+        if (!wipeCh) { ws.send(JSON.stringify({ type: "error", message: "channelId required." })); break; }
+        await kv.set(["ch_history", wipeCh], []);
+        msgHistory.set(wipeCh, []);
+        broadcast({ type: "channel_wiped", channelId: wipeCh, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Channel history wiped.` }));
+        console.log(`[admin] ${senderName} wiped channel ${wipeCh}`);
+        break;
+      }
+
+      case "admin_lock_channel": {
+        // Prevent non-admins from posting to a channel.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const lockCh  = (msg.channelId as string || "").trim();
+        const locked  = msg.locked !== false; // default true
+        if (!lockCh) { ws.send(JSON.stringify({ type: "error", message: "channelId required." })); break; }
+        const lockData = { locked, by: senderName, at: Date.now() };
+        await kv.set(["channel_lock", lockCh], lockData);
+        channelLocks.set(lockCh, lockData); // keep in-memory cache in sync
+        broadcast({ type: "channel_lock_update", channelId: lockCh, locked, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Channel ${locked ? "locked" : "unlocked"}.` }));
+        console.log(`[admin] ${senderName} ${locked ? "locked" : "unlocked"} channel ${lockCh}`);
+        break;
+      }
+
+      case "admin_transfer_ownership": {
+        // Transfer server ownership to another member.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can transfer server ownership." })); break; }
+        const toSvId   = (msg.serverId as string || "").trim();
+        const toNewOwner = (msg.newOwner as string || "").trim();
+        if (!toSvId || !toNewOwner) { ws.send(JSON.stringify({ type: "error", message: "serverId and newOwner required." })); break; }
+        const toEntry = await kv.get<Record<string, unknown>>(["servers", toSvId]);
+        if (!toEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const toNewAcct = await kv.get<Record<string, unknown>>(["accounts", toNewOwner.toLowerCase()]);
+        if (!toNewAcct.value) { ws.send(JSON.stringify({ type: "error", message: `User '${toNewOwner}' not found.` })); break; }
+        const toNewDisplayName = toNewAcct.value.name as string;
+        const updatedSvTo = { ...toEntry.value, ownerId: toNewDisplayName, ownerIdLower: toNewOwner.toLowerCase() };
+        await kv.set(["servers", toSvId], updatedSvTo);
+        if (publicServers.has(toSvId)) publicServers.set(toSvId, updatedSvTo);
+        broadcast({ type: "server_ownership_transfer", serverId: toSvId, newOwner: toNewDisplayName, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Ownership of server transferred to ${toNewDisplayName}.` }));
+        console.log(`[admin] ${senderName} transferred ownership of ${toSvId} to ${toNewDisplayName}`);
+        break;
+      }
+
+      case "admin_list_servers": {
+        // Return all servers with full metadata for the admin panel.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can list all servers." })); break; }
+        const svIter2 = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
+        const allSvs: Record<string, unknown>[] = [];
+        for await (const item of svIter2) {
+          const sv = item.value;
+          if (!sv) continue;
+          // Count members
+          let memCount = 0;
+          const memIter3 = kv.list({ prefix: ["server_member", sv.id as string] });
+          for await (const _m of memIter3) memCount++;
+          allSvs.push({
+            id: sv.id, name: sv.name, desc: sv.desc || "",
+            ownerId: sv.ownerId, ownerIdLower: sv.ownerIdLower,
+            memberCount: memCount, createdAt: sv.createdAt || 0,
+            isPublic: sv.isPublic !== false,
+            channelCount: (sv.channels as unknown[] || []).length,
+          });
+        }
+        allSvs.sort((a, b) => ((b.memberCount as number) || 0) - ((a.memberCount as number) || 0));
+        ws.send(JSON.stringify({ type: "admin_servers_list", servers: allSvs }));
+        break;
+      }
+
+      case "admin_list_bans": {
+        // Return all active bans.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const activeBans: Record<string, unknown>[] = [];
+        for (const [username, ban] of timedBans) {
+          activeBans.push({ username, until: ban.until, reason: ban.reason });
+        }
+        ws.send(JSON.stringify({ type: "admin_bans_list", bans: activeBans }));
+        break;
+      }
+
+      case "admin_view_channel": {
+        // Read any channel's message history.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const viewChId = (msg.channelId as string || "").trim();
+        if (!viewChId) { ws.send(JSON.stringify({ type: "error", message: "channelId required." })); break; }
+        const viewHist = await kv.get<unknown[]>(["ch_history", viewChId]);
+        ws.send(JSON.stringify({ type: "admin_channel_history", channelId: viewChId, messages: viewHist.value || [] }));
+        break;
+      }
+
+      case "admin_broadcast_dm": {
+        // Send a DM from "System" to any user.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send system DMs." })); break; }
+        const bdmTarget  = (msg.target as string || "").trim();
+        const bdmText    = (msg.text   as string || "").trim().slice(0, 2000);
+        if (!bdmTarget || !bdmText) { ws.send(JSON.stringify({ type: "error", message: "Target and text required." })); break; }
+        const sysDM = {
+          type: "dm", id: crypto.randomUUID(), from: "System", to: bdmTarget,
+          text: bdmText, ts: Date.now(), authorColor: "#6c63ff", system: true,
+        };
+        const bdmKey  = ["dm_history", ["system", bdmTarget.toLowerCase()].sort().join(":")];
+        const bdmHist = (await kv.get<unknown[]>(bdmKey)).value || [];
+        bdmHist.push(sysDM);
+        if (bdmHist.length > 500) bdmHist.splice(0, bdmHist.length - 500);
+        await kv.set(bdmKey, bdmHist);
+        sendToUser(bdmTarget, sysDM, true);
+        ws.send(JSON.stringify({ type: "success", message: `System DM sent to ${bdmTarget}.` }));
+        console.log(`[admin] ${senderName} sent system DM to ${bdmTarget}`);
+        break;
+      }
+
+      case "admin_freeze_user": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const fzTarget = (msg.target as string || "").trim().toLowerCase();
+        const fzReason = (msg.reason as string || "No reason given").trim().slice(0, 200);
+        if (!fzTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        if (!isAdmin && (fzTarget === "puck" || (await kv.get<Record<string,unknown>>(["accounts",fzTarget])).value?.systemRole === "admin")) {
+          ws.send(JSON.stringify({ type: "error", message: "Cannot freeze Puck." })); break;
+        }
+        const fzData = { reason: fzReason, by: senderName, at: Date.now() };
+        frozenUsers.set(fzTarget, fzData);
+        await kv.set(["frozen", fzTarget], fzData);
+        sendToUser(fzTarget, { type: "account_frozen", reason: fzReason, by: senderName }, false);
+        ws.send(JSON.stringify({ type: "success", message: `${msg.target} is now frozen.` }));
+        console.log(`[admin] ${senderName} froze ${fzTarget}: ${fzReason}`);
+        break;
+      }
+
+      case "admin_unfreeze_user": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const ufzTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!ufzTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        frozenUsers.delete(ufzTarget);
+        await kv.delete(["frozen", ufzTarget]);
+        sendToUser(ufzTarget, { type: "account_unfrozen", by: senderName }, false);
+        ws.send(JSON.stringify({ type: "success", message: `${msg.target} unfrozen.` }));
+        break;
+      }
+
+      case "admin_force_logout": {
+        // Kill all sessions for a user and forcibly disconnect them.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can force-logout users." })); break; }
+        const flTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!flTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        // Delete all KV sessions for this user
+        const flSessionIter = kv.list<string>({ prefix: ["sessions"] });
+        let flCount = 0;
+        for await (const item of flSessionIter) {
+          if (item.value === flTarget) {
+            await kv.delete(item.key);
+            sessions.delete(item.key[1] as string);
+            flCount++;
+          }
+        }
+        // Disconnect live websockets
+        for (const [cws, ci] of clients) {
+          if ((ci.name as string)?.toLowerCase() === flTarget) {
+            try {
+              cws.send(JSON.stringify({ type: "force_logout", by: senderName }));
+              cws.close(1000, "Logged out by admin");
+            } catch { /* already closing */ }
+          }
+        }
+        ws.send(JSON.stringify({ type: "success", message: `${msg.target} logged out (${flCount} session(s) invalidated).` }));
+        console.log(`[admin] ${senderName} force-logged out ${flTarget}, deleted ${flCount} session(s)`);
+        break;
+      }
+
+      case "admin_delete_message": {
+        // Delete a specific message by ID from a specific channel.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const dmsgId  = (msg.messageId as string || "").trim();
+        const dmsgCh  = (msg.channelId  as string || "").trim();
+        if (!dmsgId || !dmsgCh) { ws.send(JSON.stringify({ type: "error", message: "messageId and channelId required." })); break; }
+        const dmsgKey  = ["ch_history", dmsgCh];
+        const dmsgHist = await kv.get<unknown[]>(dmsgKey);
+        if (!dmsgHist.value) { ws.send(JSON.stringify({ type: "error", message: "Channel history not found." })); break; }
+        const dmsgBefore = dmsgHist.value.length;
+        const dmsgAfter  = dmsgHist.value.filter((m: unknown) => (m as Record<string,unknown>).id !== dmsgId);
+        if (dmsgAfter.length === dmsgBefore) { ws.send(JSON.stringify({ type: "error", message: "Message not found." })); break; }
+        await kv.set(dmsgKey, dmsgAfter);
+        msgHistory.set(dmsgCh, dmsgAfter);
+        broadcast({ type: "delete_message", messageId: dmsgId, channelId: dmsgCh, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: "Message deleted." }));
+        break;
+      }
+
+      case "admin_edit_message": {
+        // Edit any message's text in any channel.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const emsgId   = (msg.messageId as string || "").trim();
+        const emsgCh   = (msg.channelId  as string || "").trim();
+        const emsgText = (msg.text        as string || "").trim().slice(0, 4000);
+        if (!emsgId || !emsgCh || !emsgText) { ws.send(JSON.stringify({ type: "error", message: "messageId, channelId and text required." })); break; }
+        const emsgKey  = ["ch_history", emsgCh];
+        const emsgHist = await kv.get<unknown[]>(emsgKey);
+        if (!emsgHist.value) { ws.send(JSON.stringify({ type: "error", message: "Channel not found." })); break; }
+        let emsgFound  = false;
+        const emsgUpdated = emsgHist.value.map((m: unknown) => {
+          const mm = m as Record<string,unknown>;
+          if (mm.id === emsgId) { emsgFound = true; return { ...mm, text: emsgText, edited: true, editedByAdmin: senderName }; }
+          return mm;
+        });
+        if (!emsgFound) { ws.send(JSON.stringify({ type: "error", message: "Message not found." })); break; }
+        await kv.set(emsgKey, emsgUpdated);
+        msgHistory.set(emsgCh, emsgUpdated);
+        broadcast({ type: "edit_message", messageId: emsgId, channelId: emsgCh, text: emsgText, edited: true }, null);
+        ws.send(JSON.stringify({ type: "success", message: "Message edited." }));
+        break;
+      }
+
+      case "admin_add_channel": {
+        // Add a new channel to any server.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const acSvId   = (msg.serverId as string || "").trim();
+        const acName   = (msg.name     as string || "").trim().slice(0, 32).replace(/\s+/g, "-").toLowerCase();
+        const acType   = (msg.chType   as string || "text");
+        if (!acSvId || !acName) { ws.send(JSON.stringify({ type: "error", message: "serverId and name required." })); break; }
+        const acSvEntry = await kv.get<Record<string,unknown>>(["servers", acSvId]);
+        if (!acSvEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const newCh = { id: crypto.randomUUID().replace(/-/g,"").slice(0,16), name: acName, type: acType, desc: msg.desc as string || "" };
+        const acChannels = [...((acSvEntry.value.channels as unknown[]) || []), newCh];
+        const acUpdatedSv = { ...acSvEntry.value, channels: acChannels };
+        await kv.set(["servers", acSvId], acUpdatedSv);
+        if (publicServers.has(acSvId)) publicServers.set(acSvId, acUpdatedSv);
+        broadcast({ type: "server_channel_added", serverId: acSvId, channel: newCh, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Channel #${acName} added.` }));
+        console.log(`[admin] ${senderName} added channel ${acName} to server ${acSvId}`);
+        break;
+      }
+
+      case "admin_delete_channel": {
+        // Remove a channel from any server and wipe its history.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const dcSvId = (msg.serverId  as string || "").trim();
+        const dcChId = (msg.channelId as string || "").trim();
+        if (!dcSvId || !dcChId) { ws.send(JSON.stringify({ type: "error", message: "serverId and channelId required." })); break; }
+        const dcSvEntry = await kv.get<Record<string,unknown>>(["servers", dcSvId]);
+        if (!dcSvEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const dcChannels = ((dcSvEntry.value.channels as unknown[]) || []).filter((c: unknown) => (c as Record<string,unknown>).id !== dcChId);
+        const dcUpdated  = { ...dcSvEntry.value, channels: dcChannels };
+        await kv.set(["servers", dcSvId], dcUpdated);
+        if (publicServers.has(dcSvId)) publicServers.set(dcSvId, dcUpdated);
+        await kv.delete(["ch_history", dcChId]);
+        msgHistory.delete(dcChId);
+        broadcast({ type: "server_channel_deleted", serverId: dcSvId, channelId: dcChId, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: "Channel deleted." }));
+        console.log(`[admin] ${senderName} deleted channel ${dcChId} from server ${dcSvId}`);
+        break;
+      }
+
+      case "admin_rename_server": {
+        // Rename any server.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const rnSvId   = (msg.serverId as string || "").trim();
+        const rnSvName = (msg.name     as string || "").trim().slice(0, 64);
+        if (!rnSvId || !rnSvName) { ws.send(JSON.stringify({ type: "error", message: "serverId and name required." })); break; }
+        const rnEntry = await kv.get<Record<string,unknown>>(["servers", rnSvId]);
+        if (!rnEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const rnUpdated = { ...rnEntry.value, name: rnSvName };
+        await kv.set(["servers", rnSvId], rnUpdated);
+        if (publicServers.has(rnSvId)) publicServers.set(rnSvId, rnUpdated);
+        broadcast({ type: "server_renamed", serverId: rnSvId, name: rnSvName, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Server renamed to "${rnSvName}".` }));
+        break;
+      }
+
+      case "admin_add_member": {
+        // Add any user to any server directly.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const amTarget = (msg.target   as string || "").trim();
+        const amSvId   = (msg.serverId as string || "").trim();
+        if (!amTarget || !amSvId) { ws.send(JSON.stringify({ type: "error", message: "target and serverId required." })); break; }
+        const amAcctKey = ["accounts", amTarget.toLowerCase()];
+        const amAcct    = await kv.get<Record<string,unknown>>(amAcctKey);
+        if (!amAcct.value) { ws.send(JSON.stringify({ type: "error", message: `User '${amTarget}' not found.` })); break; }
+        const amSvEntry = await kv.get<Record<string,unknown>>(["servers", amSvId]);
+        if (!amSvEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        await kv.set(["server_member", amSvId, amAcct.value.name as string], { joinedAt: Date.now(), addedBy: senderName });
+        await addServerToUser(amTarget.toLowerCase(), amSvId);
+        sendToUser(amAcct.value.name as string, { type: "added_to_server", server: amSvEntry.value, by: senderName }, true);
+        broadcast({ type: "member_join", serverId: amSvId, user: amAcct.value.name }, null);
+        ws.send(JSON.stringify({ type: "success", message: `${amAcct.value.name} added to server.` }));
+        console.log(`[admin] ${senderName} added ${amTarget} to server ${amSvId}`);
+        break;
+      }
+
+      case "admin_set_bio": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can set user bios." })); break; }
+        const bioTarget = (msg.target as string || "").trim().toLowerCase();
+        const bioText   = (msg.bio    as string || "").trim().slice(0, 300);
+        if (!bioTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const bioKey   = ["accounts", bioTarget];
+        const bioEntry = await kv.get<Record<string,unknown>>(bioKey);
+        if (!bioEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        await kv.set(bioKey, { ...bioEntry.value, bio: bioText });
+        broadcast({ type: "profile_update", user: bioEntry.value.name, bio: bioText, color: bioEntry.value.color, pfp: bioEntry.value.pfp }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Bio updated for ${bioEntry.value.name}.` }));
+        break;
+      }
+
+      case "admin_wipe_user_pfp": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can wipe profile pictures." })); break; }
+        const wpTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!wpTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const wpKey   = ["accounts", wpTarget];
+        const wpEntry = await kv.get<Record<string,unknown>>(wpKey);
+        if (!wpEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        await kv.set(wpKey, { ...wpEntry.value, pfp: null });
+        for (const [, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === wpTarget) (ci as Record<string,unknown>).pfp = null;
+        }
+        broadcast({ type: "profile_update", user: wpEntry.value.name, pfp: null, color: wpEntry.value.color }, null);
+        ws.send(JSON.stringify({ type: "success", message: `PFP wiped for ${wpEntry.value.name}.` }));
+        break;
+      }
+
+      case "admin_delete_dm_history": {
+        // Wipe DM history between two users.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can delete DM history." })); break; }
+        const ddmA = (msg.userA as string || "").trim().toLowerCase();
+        const ddmB = (msg.userB as string || "").trim().toLowerCase();
+        if (!ddmA || !ddmB) { ws.send(JSON.stringify({ type: "error", message: "userA and userB required." })); break; }
+        const ddmKey = ["dm_history", [ddmA, ddmB].sort().join(":")];
+        await kv.delete(ddmKey);
+        ws.send(JSON.stringify({ type: "success", message: `DM history between ${ddmA} and ${ddmB} deleted.` }));
+        console.log(`[admin] ${senderName} wiped DMs between ${ddmA} and ${ddmB}`);
+        break;
+      }
+
+      case "admin_get_stats": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        // Count online users
+        const onlineCount = clients.size;
+        // Count total accounts
+        let totalAccounts = 0;
+        const statsAcctIter = kv.list({ prefix: ["accounts"] });
+        for await (const _ of statsAcctIter) totalAccounts++;
+        // Count total servers
+        let totalServers = 0;
+        const statsSvIter = kv.list({ prefix: ["servers"] });
+        for await (const _ of statsSvIter) totalServers++;
+        // Count total messages across all channels
+        let totalMessages = 0;
+        const statsChIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
+        for await (const item of statsChIter) totalMessages += item.value?.length || 0;
+        // Count total DM convos
+        let totalDmConvos = 0;
+        const statsDmIter = kv.list({ prefix: ["dm_history"] });
+        for await (const _ of statsDmIter) totalDmConvos++;
+        ws.send(JSON.stringify({
+          type: "admin_stats",
+          stats: {
+            onlineNow: onlineCount,
+            totalAccounts,
+            totalServers,
+            totalMessages,
+            totalDmConvos,
+            frozenUsers: frozenUsers.size,
+            activeBans: timedBans.size,
+            lockedChannels: channelLocks.size,
+            deployVersion: DEPLOY_VERSION,
+          }
+        }));
+        break;
+      }
+
+      case "admin_list_online": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const onlineList = [];
+        for (const [, ci] of clients) {
+          onlineList.push({
+            name: ci.name,
+            tag: ci.tag,
+            color: ci.color,
+            systemRole: ci.systemRole,
+            coAdmin: ci.coAdmin,
+            frozen: frozenUsers.has((ci.name as string)?.toLowerCase()),
+          });
+        }
+        ws.send(JSON.stringify({ type: "admin_online_list", users: onlineList }));
+        break;
+      }
+
+      case "admin_set_motd": {
+        // Set / clear the platform-wide Message of the Day shown on login.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can set the MOTD." })); break; }
+        const motdText = (msg.text as string || "").trim().slice(0, 500);
+        if (motdText) {
+          await kv.set(["platform", "motd"], { text: motdText, by: senderName, at: Date.now() });
+        } else {
+          await kv.delete(["platform", "motd"]);
+        }
+        broadcast({ type: "motd_update", text: motdText, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: motdText ? "MOTD set." : "MOTD cleared." }));
+        break;
+      }
+
+      case "admin_list_frozen": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const frozenList = [];
+        for (const [username, data] of frozenUsers) {
+          frozenList.push({ username, ...data });
+        }
+        ws.send(JSON.stringify({ type: "admin_frozen_list", frozen: frozenList }));
+        break;
+      }
+
+      case "admin_impersonate_send": {
+        // Post a message into any channel AS any user — the message appears as if they sent it.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can impersonate users." })); break; }
+        const impAs   = (msg.asUser   as string || "").trim();
+        const impCh   = (msg.channelId as string || "").trim();
+        const impText = (msg.text      as string || "").trim().slice(0, 4000);
+        if (!impAs || !impCh || !impText) { ws.send(JSON.stringify({ type: "error", message: "asUser, channelId and text required." })); break; }
+        const impAcct = await kv.get<Record<string,unknown>>(["accounts", impAs.toLowerCase()]);
+        if (!impAcct.value) { ws.send(JSON.stringify({ type: "error", message: `User '${impAs}' not found.` })); break; }
+        const impMsg = {
+          type: "message", id: crypto.randomUUID().replace(/-/g,""),
+          channelId: impCh, author: impAcct.value.name,
+          authorColor: impAcct.value.color || "#6c63ff",
+          text: impText, ts: Date.now(), attachments: [],
+          _impersonated: true, _impersonatedBy: senderName,
+        };
+        const impKey  = ["ch_history", impCh];
+        const impHist = (await kv.get<unknown[]>(impKey)).value || [];
+        impHist.push(impMsg);
+        if (impHist.length > 500) impHist.splice(0, impHist.length - 500);
+        await kv.set(impKey, impHist);
+        storeMessage(impCh, impMsg);
+        broadcast(impMsg, null);
+        await auditLog("impersonate_send", senderName, { asUser: impAs, channelId: impCh, text: impText.slice(0,80) });
+        ws.send(JSON.stringify({ type: "success", message: `Message sent as ${impAcct.value.name}.` }));
+        break;
+      }
+
+      case "admin_nuke_account": {
+        // Permanently and completely delete an account. Wipes messages, memberships, DMs, sessions.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can nuke accounts." })); break; }
+        const nukeTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!nukeTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        if (nukeTarget === "puck") { ws.send(JSON.stringify({ type: "error", message: "Cannot nuke Puck." })); break; }
+        const nukeAcct = await kv.get<Record<string,unknown>>(["accounts", nukeTarget]);
+        if (!nukeAcct.value) { ws.send(JSON.stringify({ type: "error", message: `User '${nukeTarget}' not found.` })); break; }
+        const nukeDisplayName = nukeAcct.value.name as string;
+
+        // 1. Delete account
+        await kv.delete(["accounts", nukeTarget]);
+
+        // 2. Delete all sessions
+        const nukeSessIter = kv.list<string>({ prefix: ["sessions"] });
+        for await (const item of nukeSessIter) {
+          if (item.value === nukeTarget) { await kv.delete(item.key); sessions.delete(item.key[1] as string); }
+        }
+
+        // 3. Delete user_servers index
+        await kv.delete(["user_servers", nukeTarget]);
+
+        // 4. Remove from all server memberships
+        const nukeMemIter = kv.list({ prefix: ["server_member"] });
+        for await (const item of nukeMemIter) {
+          if ((item.key[2] as string)?.toLowerCase() === nukeTarget) await kv.delete(item.key);
+        }
+
+        // 5. Purge all channel messages by this user
+        const nukeChIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
+        for await (const item of nukeChIter) {
+          if (!item.value?.length) continue;
+          const filtered = item.value.filter((m: unknown) => (m as Record<string,unknown>).author?.toString().toLowerCase() !== nukeTarget);
+          if (filtered.length !== item.value.length) {
+            await kv.set(item.key, filtered);
+            msgHistory.set(item.key[1] as string, filtered);
+          }
+        }
+
+        // 6. Delete DM history involving this user
+        const nukeDmIter = kv.list({ prefix: ["dm_history"] });
+        for await (const item of nukeDmIter) {
+          if ((item.key[1] as string).includes(nukeTarget)) await kv.delete(item.key);
+        }
+
+        // 7. Delete bans/freeze/notes
+        await kv.delete(["bans",   nukeTarget]);
+        await kv.delete(["frozen", nukeTarget]);
+        await kv.delete(["admin_notes", nukeTarget]);
+        frozenUsers.delete(nukeTarget);
+        timedBans.delete(nukeTarget);
+
+        // 8. Kill live connections
+        for (const [cws, ci] of clients) {
+          if ((ci.name as string)?.toLowerCase() === nukeTarget) {
+            try { cws.send(JSON.stringify({ type: "force_logout", by: senderName })); cws.close(1000, "Account deleted"); } catch { /* ok */ }
+          }
+        }
+
+        broadcast({ type: "admin_nuke", target: nukeDisplayName, by: senderName }, null);
+        await auditLog("nuke_account", senderName, { target: nukeTarget });
+        ws.send(JSON.stringify({ type: "success", message: `Account '${nukeDisplayName}' and all associated data permanently deleted.` }));
+        console.log(`[admin] ${senderName} NUKED account ${nukeTarget}`);
+        break;
+      }
+
+      case "admin_set_tag": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can change user tags." })); break; }
+        const stTarget = (msg.target as string || "").trim().toLowerCase();
+        const stTag    = (msg.tag    as string || "").trim();
+        if (!stTarget || !/^\d{4}$/.test(stTag)) { ws.send(JSON.stringify({ type: "error", message: "Target and 4-digit tag required." })); break; }
+        const stKey   = ["accounts", stTarget];
+        const stEntry = await kv.get<Record<string,unknown>>(stKey);
+        if (!stEntry.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        await kv.set(stKey, { ...stEntry.value, tag: stTag });
+        for (const [, ci] of clients) {
+          if ((ci.name as string).toLowerCase() === stTarget) (ci as Record<string,unknown>).tag = stTag;
+        }
+        broadcast({ type: "profile_update", user: stEntry.value.name, tag: stTag, color: stEntry.value.color, pfp: stEntry.value.pfp }, null);
+        ws.send(JSON.stringify({ type: "success", message: `Tag updated to #${stTag} for ${stEntry.value.name}.` }));
+        break;
+      }
+
+      case "admin_set_slowmode": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const smCh   = (msg.channelId as string || "").trim();
+        const smSecs = Math.max(0, Math.min(3600, parseInt(msg.seconds as string) || 0));
+        if (!smCh) { ws.send(JSON.stringify({ type: "error", message: "channelId required." })); break; }
+        if (smSecs === 0) {
+          slowmodes.delete(smCh);
+          await kv.delete(["slowmode", smCh]);
+        } else {
+          slowmodes.set(smCh, smSecs);
+          await kv.set(["slowmode", smCh], smSecs);
+        }
+        broadcast({ type: "slowmode_update", channelId: smCh, seconds: smSecs, by: senderName }, null);
+        ws.send(JSON.stringify({ type: "success", message: smSecs ? `Slowmode set to ${smSecs}s.` : "Slowmode disabled." }));
+        break;
+      }
+
+      case "admin_set_maintenance": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can toggle maintenance mode." })); break; }
+        maintenanceMode = msg.enabled === true;
+        if (maintenanceMode) {
+          await kv.set(["platform", "maintenance"], true);
+        } else {
+          await kv.delete(["platform", "maintenance"]);
+        }
+        broadcast({ type: "maintenance_update", enabled: maintenanceMode, by: senderName }, null);
+        if (maintenanceMode) {
+          // Kick all non-admins
+          let kicked = 0;
+          for (const [cws, ci] of clients) {
+            if (ci.systemRole !== "admin") {
+              try {
+                cws.send(JSON.stringify({ type: "maintenance", message: "Nexus is entering maintenance mode. Please reconnect later." }));
+                cws.close(1000, "Maintenance");
+                kicked++;
+              } catch { /* ok */ }
+            }
+          }
+          ws.send(JSON.stringify({ type: "success", message: `Maintenance mode ON. Kicked ${kicked} non-admin user(s).` }));
+        } else {
+          ws.send(JSON.stringify({ type: "success", message: "Maintenance mode OFF. Platform is live." }));
+        }
+        await auditLog("maintenance_toggle", senderName, { enabled: maintenanceMode });
+        break;
+      }
+
+      case "admin_mass_dm": {
+        // Send a system DM to every registered user.
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send mass DMs." })); break; }
+        const massDmText = (msg.text as string || "").trim().slice(0, 2000);
+        if (!massDmText) { ws.send(JSON.stringify({ type: "error", message: "Text required." })); break; }
+        const massDmIter = kv.list<Record<string,unknown>>({ prefix: ["accounts"] });
+        let massDmCount = 0;
+        for await (const item of massDmIter) {
+          const recipient = item.value?.name as string;
+          if (!recipient || recipient === senderName) continue;
+          const sysMassMsg = {
+            type: "dm", id: crypto.randomUUID().replace(/-/g,""),
+            from: "System", to: recipient, text: massDmText,
+            ts: Date.now(), authorColor: "#6c63ff", system: true,
+          };
+          const massKey  = ["dm_history", ["system", recipient.toLowerCase()].sort().join(":")];
+          const massHist = (await kv.get<unknown[]>(massKey)).value || [];
+          massHist.push(sysMassMsg);
+          if (massHist.length > 500) massHist.splice(0, massHist.length - 500);
+          await kv.set(massKey, massHist);
+          sendToUser(recipient, sysMassMsg, true);
+          massDmCount++;
+        }
+        await auditLog("mass_dm", senderName, { text: massDmText.slice(0,80), recipients: massDmCount });
+        ws.send(JSON.stringify({ type: "success", message: `Mass DM sent to ${massDmCount} user(s).` }));
+        break;
+      }
+
+      case "admin_clone_server": {
+        // Duplicate a server's channels & settings into a new server (no members, no messages).
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can clone servers." })); break; }
+        const cloneSrcId  = (msg.serverId as string || "").trim();
+        const cloneName   = (msg.name     as string || "").trim().slice(0, 64);
+        if (!cloneSrcId || !cloneName) { ws.send(JSON.stringify({ type: "error", message: "serverId and name required." })); break; }
+        const cloneSrc = await kv.get<Record<string,unknown>>(["servers", cloneSrcId]);
+        if (!cloneSrc.value) { ws.send(JSON.stringify({ type: "error", message: "Source server not found." })); break; }
+        const cloneId  = crypto.randomUUID().replace(/-/g,"").slice(0,16);
+        // Give cloned channels fresh IDs
+        const srcChannels = (cloneSrc.value.channels as Array<Record<string,unknown>>) || [];
+        const clonedChannels = srcChannels.map(ch => ({ ...ch, id: crypto.randomUUID().replace(/-/g,"").slice(0,16) }));
+        const cloneData = {
+          id: cloneId, name: cloneName, desc: cloneSrc.value.desc || "",
+          icon: null, color: cloneSrc.value.color || "#6c63ff",
+          memberCount: 1, createdAt: Date.now(),
+          channels: clonedChannels,
+          ownerId: senderName, ownerIdLower: senderName.toLowerCase(),
+          isPublic: cloneSrc.value.isPublic !== false,
+        };
+        await kv.set(["servers", cloneId], cloneData);
+        await kv.set(["server_member", cloneId, senderName], { joinedAt: Date.now() });
+        await addServerToUser(senderName.toLowerCase(), cloneId);
+        if (cloneData.isPublic) publicServers.set(cloneId, cloneData);
+        ws.send(JSON.stringify({ type: "server_create_ok", server: cloneData }));
+        ws.send(JSON.stringify({ type: "success", message: `Server '${cloneName}' cloned from '${cloneSrc.value.name}'.` }));
+        break;
+      }
+
+      case "admin_set_server_icon": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const ssiSvId = (msg.serverId as string || "").trim();
+        const ssiIcon = msg.icon as string | null;
+        if (!ssiSvId) { ws.send(JSON.stringify({ type: "error", message: "serverId required." })); break; }
+        const ssiEntry = await kv.get<Record<string,unknown>>(["servers", ssiSvId]);
+        if (!ssiEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const ssiUpdated = { ...ssiEntry.value, icon: ssiIcon || null };
+        await kv.set(["servers", ssiSvId], ssiUpdated);
+        if (publicServers.has(ssiSvId)) publicServers.set(ssiSvId, ssiUpdated);
+        broadcast({ type: "server_updated", serverId: ssiSvId, icon: ssiIcon, name: ssiEntry.value.name }, null);
+        ws.send(JSON.stringify({ type: "success", message: "Server icon updated." }));
+        break;
+      }
+
+      case "admin_set_server_desc": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const ssdSvId = (msg.serverId as string || "").trim();
+        const ssdDesc = (msg.desc    as string || "").trim().slice(0, 300);
+        if (!ssdSvId) { ws.send(JSON.stringify({ type: "error", message: "serverId required." })); break; }
+        const ssdEntry = await kv.get<Record<string,unknown>>(["servers", ssdSvId]);
+        if (!ssdEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const ssdUpdated = { ...ssdEntry.value, desc: ssdDesc };
+        await kv.set(["servers", ssdSvId], ssdUpdated);
+        if (publicServers.has(ssdSvId)) publicServers.set(ssdSvId, ssdUpdated);
+        broadcast({ type: "server_updated", serverId: ssdSvId, desc: ssdDesc, name: ssdEntry.value.name }, null);
+        ws.send(JSON.stringify({ type: "success", message: "Server description updated." }));
+        break;
+      }
+
+      case "admin_set_server_public": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const sspSvId  = (msg.serverId as string || "").trim();
+        const sspPublic = msg.isPublic !== false;
+        if (!sspSvId) { ws.send(JSON.stringify({ type: "error", message: "serverId required." })); break; }
+        const sspEntry = await kv.get<Record<string,unknown>>(["servers", sspSvId]);
+        if (!sspEntry.value) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        const sspUpdated = { ...sspEntry.value, isPublic: sspPublic };
+        await kv.set(["servers", sspSvId], sspUpdated);
+        if (sspPublic) publicServers.set(sspSvId, sspUpdated); else publicServers.delete(sspSvId);
+        ws.send(JSON.stringify({ type: "success", message: `Server set to ${sspPublic ? "public" : "private"}.` }));
+        break;
+      }
+
+      case "admin_add_note": {
+        // Attach an internal admin note to any account. Never shown to the user.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const noteTarget = (msg.target as string || "").trim().toLowerCase();
+        const noteText   = (msg.note   as string || "").trim().slice(0, 1000);
+        if (!noteTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const notesKey = ["admin_notes", noteTarget];
+        const existing = (await kv.get<unknown[]>(notesKey)).value || [];
+        existing.push({ text: noteText, by: senderName, at: Date.now() });
+        await kv.set(notesKey, existing);
+        ws.send(JSON.stringify({ type: "success", message: "Note saved." }));
+        ws.send(JSON.stringify({ type: "admin_notes_data", target: noteTarget, notes: existing }));
+        break;
+      }
+
+      case "admin_get_notes": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const gnTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!gnTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const gnNotes = (await kv.get<unknown[]>(["admin_notes", gnTarget])).value || [];
+        ws.send(JSON.stringify({ type: "admin_notes_data", target: gnTarget, notes: gnNotes }));
+        break;
+      }
+
+      case "admin_delete_note": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const dnTarget = (msg.target as string || "").trim().toLowerCase();
+        const dnIndex  = parseInt(msg.index as string) || 0;
+        if (!dnTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const dnKey   = ["admin_notes", dnTarget];
+        const dnNotes = (await kv.get<unknown[]>(dnKey)).value || [];
+        dnNotes.splice(dnIndex, 1);
+        await kv.set(dnKey, dnNotes);
+        ws.send(JSON.stringify({ type: "admin_notes_data", target: dnTarget, notes: dnNotes }));
+        ws.send(JSON.stringify({ type: "success", message: "Note deleted." }));
+        break;
+      }
+
+      case "admin_get_audit_log": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const auditLimit = Math.min(200, parseInt(msg.limit as string) || 50);
+        const auditEntries: unknown[] = [];
+        const auditIter = kv.list({ prefix: ["audit"], reverse: true, limit: auditLimit });
+        for await (const item of auditIter) auditEntries.push(item.value);
+        ws.send(JSON.stringify({ type: "admin_audit_log", entries: auditEntries }));
+        break;
+      }
+
+      case "admin_clear_audit_log": {
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can clear the audit log." })); break; }
+        const clearIter = kv.list({ prefix: ["audit"] });
+        let clearCount = 0;
+        for await (const item of clearIter) { await kv.delete(item.key); clearCount++; }
+        ws.send(JSON.stringify({ type: "success", message: `Audit log cleared (${clearCount} entries).` }));
+        break;
+      }
+
+      case "admin_list_user_servers": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const lusTarget = (msg.target as string || "").trim().toLowerCase();
+        if (!lusTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        const lusIds = (await kv.get<string[]>(["user_servers", lusTarget])).value || [];
+        const lusList: unknown[] = [];
+        for (const svId of lusIds) {
+          const sv = await kv.get<Record<string,unknown>>(["servers", svId]);
+          if (sv.value) lusList.push({ id: sv.value.id, name: sv.value.name, ownerId: sv.value.ownerId });
+        }
+        ws.send(JSON.stringify({ type: "admin_user_servers", target: lusTarget, servers: lusList }));
+        break;
+      }
+
+      case "admin_export_channel": {
+        // Export a channel's full history as JSON back to the requester.
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const expChId = (msg.channelId as string || "").trim();
+        if (!expChId) { ws.send(JSON.stringify({ type: "error", message: "channelId required." })); break; }
+        const expHist = (await kv.get<unknown[]>(["ch_history", expChId])).value || [];
+        ws.send(JSON.stringify({ type: "admin_channel_export", channelId: expChId, messages: expHist, exportedAt: Date.now() }));
+        break;
+      }
+
+      case "admin_send_unread_announce": {
+        // Push a notification to all users (appears as a notification ping).
+        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send announcements." })); break; }
+        const announceText = (msg.text as string || "").trim().slice(0, 500);
+        if (!announceText) { ws.send(JSON.stringify({ type: "error", message: "Text required." })); break; }
+        broadcast({ type: "platform_announcement", text: announceText, by: senderName, at: Date.now() }, null);
+        await auditLog("send_announcement", senderName, { text: announceText.slice(0,80) });
+        ws.send(JSON.stringify({ type: "success", message: "Announcement sent to all online users." }));
         break;
       }
 
