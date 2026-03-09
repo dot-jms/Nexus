@@ -5,7 +5,10 @@
 // ─── Deploy version — changes on every new deploy ───────────────────────────
 // Deno Deploy re-runs this file fresh on each deploy, so Date.now() at module
 // load time gives a unique version per deployment automatically.
-const DEPLOY_VERSION = Date.now().toString(36);
+// DEPLOY_VERSION: stable across cold starts — only changes when code actually changes.
+// Using a fixed string that you manually bump on real deploys, NOT Date.now() which
+// changes every cold start and triggers spurious client reloads on Deno Deploy free tier.
+const DEPLOY_VERSION = "v1";
 console.log(`[nexus] deploy version: ${DEPLOY_VERSION}`);
 
 // ─── KV setup ───────────────────────────────────────────────────────────────
@@ -1841,7 +1844,7 @@ Deno.serve((req) => {
       }
 
       case "admin_edit_message": {
-        // Edit any message's text in any channel.
+        // Silently edit any message — no "edited" marker shown to users.
         if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
         const emsgId   = (msg.messageId as string || "").trim();
         const emsgCh   = (msg.channelId  as string || "").trim();
@@ -1853,13 +1856,15 @@ Deno.serve((req) => {
         let emsgFound  = false;
         const emsgUpdated = emsgHist.value.map((m: unknown) => {
           const mm = m as Record<string,unknown>;
-          if (mm.id === emsgId) { emsgFound = true; return { ...mm, text: emsgText, edited: true, editedByAdmin: senderName }; }
+          // Strip any existing edited flag so it vanishes completely
+          if (mm.id === emsgId) { emsgFound = true; const { edited: _e, editedByAdmin: _ea, ...rest } = mm; return { ...rest, text: emsgText }; }
           return mm;
         });
         if (!emsgFound) { ws.send(JSON.stringify({ type: "error", message: "Message not found." })); break; }
         await kv.set(emsgKey, emsgUpdated);
         msgHistory.set(emsgCh, emsgUpdated);
-        broadcast({ type: "edit_message", messageId: emsgId, channelId: emsgCh, text: emsgText, edited: true }, null);
+        // silent: false tells the client not to show (edited)
+        broadcast({ type: "edit_message", messageId: emsgId, channelId: emsgCh, text: emsgText, edited: false, silent: true }, null);
         ws.send(JSON.stringify({ type: "success", message: "Message edited." }));
         break;
       }
