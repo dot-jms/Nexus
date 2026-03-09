@@ -60,24 +60,7 @@ const sessions = new Map<string, string>();
 const clients = new Map<WebSocket, Record<string, unknown>>();
 const publicServers = new Map<string, Record<string, unknown>>();
 const msgHistory = new Map<string, unknown[]>();
-
-// ─── Offline queue with LRU eviction ────────────────────────────────────────
-// Capped at MAX_OFFLINE_USERS entries. When the cap is hit, the oldest (least
-// recently queued) user's queue is evicted to prevent unbounded memory growth
-// during a thundering disconnect (e.g. a deploy bounce with 10k users offline).
-const MAX_OFFLINE_USERS = 2000;
 const offline = new Map<string, unknown[]>();
-function offlineSet(nameLower: string, msgs: unknown[]) {
-  // If already exists, delete-then-set to refresh insertion order (LRU)
-  offline.delete(nameLower);
-  if (offline.size >= MAX_OFFLINE_USERS) {
-    // Evict the oldest entry (first in insertion order)
-    const oldest = offline.keys().next().value;
-    if (oldest) offline.delete(oldest);
-  }
-  offline.set(nameLower, msgs);
-}
-
 // timed bans: lowercase username → { until: number, reason: string }
 // FIX #3: timedBans is now the in-memory cache; source of truth is KV ["bans", username]
 const timedBans = new Map<string, { until: number; reason: string }>();
@@ -98,29 +81,6 @@ const ghostCalls = new Map<string, string>();
 let maintenanceMode = false;
 // audit log ring buffer (last 500 admin actions, also persisted to KV)
 const AUDIT_LIMIT = 500;
-
-
-// ─── Per-user message rate limiter ──────────────────────────────────────────
-// Allows bursts but enforces a rolling window cap: max 8 messages per 4 seconds.
-// Power users (admin / co-admin) are exempt.
-const MSG_RATE_WINDOW_MS = 4000;
-const MSG_RATE_MAX = 8;
-const msgRateWindows = new Map<string, number[]>(); // username → timestamps[]
-function checkMsgRate(username: string): boolean {
-  const now = Date.now();
-  const window = (msgRateWindows.get(username) || []).filter(t => now - t < MSG_RATE_WINDOW_MS);
-  if (window.length >= MSG_RATE_MAX) return false; // rate limited
-  window.push(now);
-  msgRateWindows.set(username, window);
-  return true;
-}
-// Clean up stale rate windows every 30s to prevent memory leak
-setInterval(() => {
-  const now = Date.now();
-  for (const [u, times] of msgRateWindows) {
-    if (times.every(t => now - t >= MSG_RATE_WINDOW_MS)) msgRateWindows.delete(u);
-  }
-}, 30_000);
 
 // ─── Stale call cleanup — runs every 60s, removes calls where no participants are online ─
 setInterval(() => {
@@ -143,31 +103,6 @@ function broadcast(data: unknown, exclude: WebSocket | null = null) {
   }
 }
 
-// Scoped broadcast — only sends to clients who are members of a specific server.
-// This is critical for scale: at 1000 users, a "message" event should only fan
-// out to the N users in that server, not iterate all 1000 open sockets.
-// Falls back to full broadcast if serverId is missing (e.g. admin events).
-function broadcastToServer(serverId: string, data: unknown, exclude: WebSocket | null = null) {
-  const msg = JSON.stringify(data);
-  for (const [ws, ci] of clients) {
-    if (ws === exclude || ws.readyState !== WebSocket.OPEN) continue;
-    const ids = ci.serverIds as Set<string> | undefined;
-    if (ids?.has(serverId)) ws.send(msg);
-  }
-}
-
-// Update a client's in-memory server membership when they join or leave a server
-function clientJoinServer(ws: WebSocket, serverId: string) {
-  const ci = clients.get(ws);
-  if (!ci) return;
-  if (!ci.serverIds) ci.serverIds = new Set<string>();
-  (ci.serverIds as Set<string>).add(serverId);
-}
-function clientLeaveServer(ws: WebSocket, serverId: string) {
-  const ci = clients.get(ws);
-  if (ci?.serverIds) (ci.serverIds as Set<string>).delete(serverId);
-}
-
 function sendToUser(name: string, data: unknown, queue = true): boolean {
   // BUG 4 FIX: offline queue used mixed-case names as keys, causing misses on flush.
   // Normalize to lowercase so sendToUser("Alice") and offline.get("alice") always match.
@@ -180,10 +115,10 @@ function sendToUser(name: string, data: unknown, queue = true): boolean {
     }
   }
   if (!delivered && queue) {
-    const existing = offline.get(nameLower) || [];
-    existing.push(data);
-    if (existing.length > 200) existing.splice(0, existing.length - 200);
-    offlineSet(nameLower, existing);
+    if (!offline.has(nameLower)) offline.set(nameLower, []);
+    const q = offline.get(nameLower)!;
+    q.push(data);
+    if (q.length > 200) q.splice(0, q.length - 200);
   }
   return delivered;
 }
@@ -341,28 +276,6 @@ Deno.serve((req) => {
         "content-type": "application/json",
         // Never cache this endpoint
         "cache-control": "no-store, no-cache, must-revalidate",
-        "access-control-allow-origin": "*",
-      },
-    });
-  }
-
-  // ── Health endpoint — real-time platform stats for monitoring ──────────
-  if (url.pathname === "/_health") {
-    const health = {
-      ok: true,
-      version: DEPLOY_VERSION,
-      uptime: Math.round(process?.hrtime?.()[0] ?? 0),
-      connections: clients.size,
-      publicServers: publicServers.size,
-      activeCalls: activeCalls.size,
-      offlineQueues: offline.size,
-      maintenanceMode,
-      ts: Date.now(),
-    };
-    return new Response(JSON.stringify(health, null, 2), {
-      headers: {
-        "content-type": "application/json",
-        "cache-control": "no-store",
         "access-control-allow-origin": "*",
       },
     });
@@ -629,10 +542,7 @@ Deno.serve((req) => {
 
       // MIGRATION: also scan all servers in KV where ownerId matches this user
       // (handles servers created before server_create saved user_servers at all)
-      // Gated behind acct.migrated so this only ever runs ONCE per account — not on
-      // every login. At scale, a full kv.list(["servers"]) scan on every identify
-      // would add hundreds of ms of login latency and eat the KV ops budget.
-      if (!acct?.migrated) {
+      {
         const knownIds = new Set(userSvIdsEntry.value || []);
         const svScanIter = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
         const recovered: string[] = [];
@@ -654,22 +564,15 @@ Deno.serve((req) => {
           await kv.set(userSvsKey, merged);
           userSvIdsEntry = await kv.get<string[]>(userSvsKey);
         }
-        // Mark account as migrated so we never scan again
-        const acctKey = ["accounts", tokenUser];
-        const acctEntry = await kv.get<Record<string, unknown>>(acctKey);
-        if (acctEntry.value) await kv.set(acctKey, { ...acctEntry.value, migrated: true });
-        console.log(`[migrate] marked ${name} as migrated`);
       }
 
       console.log(`[identify] user=${name} (key=${tokenUser}) user_servers=${JSON.stringify(userSvIdsEntry.value)}`);
       const userSvIds = userSvIdsEntry.value || [];
 
-      // Fetch all user's servers in parallel — no sequential awaits
-      const svEntries = await Promise.all(
-        userSvIds.map(svId => kv.get<Record<string, unknown>>(["servers", svId]))
-      );
       const userServers: Record<string, unknown>[] = [];
-      for (const svEntry of svEntries) {
+      for (const svId of userSvIds) {
+        const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
+        console.log(`[identify] svId=${svId} found=${!!svEntry.value}`);
         if (svEntry.value) {
           const sv = svEntry.value;
           userServers.push({
@@ -685,11 +588,6 @@ Deno.serve((req) => {
         }
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
-
-      // Store the user's server membership in-memory so broadcastToServer()
-      // can route messages to only relevant clients without any KV reads.
-      const ci = clients.get(ws)!;
-      ci.serverIds = new Set(userSvIds);
 
       const friendsList = (await kv.get(["friends", tokenUser])).value || [];
       const pendingReqs: unknown[] = [];
@@ -896,11 +794,6 @@ Deno.serve((req) => {
           ws.send(JSON.stringify({ type: "error", message: `Your account is frozen: ${freeze.reason}` }));
           break;
         }
-        // Per-user rate limit — max 8 messages per 4s window (power users exempt)
-        if (!isPowerUser && !checkMsgRate(senderName.toLowerCase())) {
-          ws.send(JSON.stringify({ type: "error", message: "Slow down! You're sending messages too fast." }));
-          break;
-        }
         // Slowmode check
         const slowSecs = slowmodes.get(msg.channelId as string) || 0;
         if (slowSecs > 0 && !isPowerUser) {
@@ -940,13 +833,7 @@ Deno.serve((req) => {
           try { await kv.set(chKey, trimmed); } catch(_) {}
         }
         storeMessage(msg.channelId as string, msg);
-        // Scoped broadcast — only fans out to members of this server, not all 1000 clients
-        const msgServerId = msg.serverId as string;
-        if (msgServerId) {
-          broadcastToServer(msgServerId, msg, ws);
-        } else {
-          broadcast(msg, ws); // fallback for msgs without serverId
-        }
+        broadcast(msg, ws);
         break;
       }
 
@@ -973,12 +860,9 @@ Deno.serve((req) => {
       case "kick_member":
       case "status_update":
       case "pin_message":
-      case "channel_delete": {
-        const svId = msg.serverId as string;
-        if (svId) broadcastToServer(svId, msg, ws);
-        else broadcast(msg, ws);
+      case "channel_delete":
+        broadcast(msg, ws);
         break;
-      }
 
       case "video_request": {
         // Broadcast to all channel members — anyone who has this video cached will respond
@@ -1000,10 +884,6 @@ Deno.serve((req) => {
       }
 
       case "reaction": {
-        // BUG A FIX: msg.user was read from client payload — a user could set
-        // msg.user = "SomeoneElse" to add/remove reactions on their behalf.
-        // Pin it to the authenticated senderName.
-        msg.user = senderName;
         // Persist reaction to KV history
         const rxChId = msg.channelId as string;
         const rxKey = ["ch_history", rxChId];
@@ -1028,9 +908,11 @@ Deno.serve((req) => {
             await kv.set(rxKey, rxHist);
           }
         }
-        const rxServerId = msg.serverId as string;
-        if (rxServerId) { broadcastToServer(rxServerId, msg, ws); } else { broadcast(msg, ws); }
+        broadcast(msg, ws);
         break;
+      }
+
+      case "delete_message": {
         // Remove from KV history so it's gone after reload
         const delChId = msg.channelId as string;
         const delMsgId = msg.messageId as string;
@@ -1285,7 +1167,8 @@ Deno.serve((req) => {
 
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         await addServerToUser(senderName, msg.serverId as string);
-        clientJoinServer(ws, msg.serverId as string); // update in-memory routing index
+
+        // Verify user_servers index
         const verifyIndex = await kv.get(["user_servers", senderName.toLowerCase()]);
         console.log(`[server_create] user_servers index for ${senderName.toLowerCase()}=${JSON.stringify(verifyIndex.value)}`);
 
@@ -1391,7 +1274,6 @@ Deno.serve((req) => {
         }
         await kv.delete(["server_member", msg.serverId as string, senderName]);
         await removeServerFromUser(senderName, msg.serverId as string);
-        clientLeaveServer(ws, msg.serverId as string); // update in-memory routing index
         broadcast(msg, ws);
         break;
       }
@@ -1402,7 +1284,6 @@ Deno.serve((req) => {
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         // FIX: Use helper to ensure consistent lowercase key
         await addServerToUser(senderName, msg.serverId as string);
-        clientJoinServer(ws, msg.serverId as string); // update in-memory routing index
         broadcast(msg, ws);
         break;
       }
@@ -1467,39 +1348,27 @@ Deno.serve((req) => {
 
       case "get_members": {
         const svId = msg.serverId as string;
-
-        // Collect all member names from KV in one list scan
-        const memIter = kv.list({ prefix: ["server_member", svId] });
-        const memberNames: string[] = [];
-        for await (const item of memIter) memberNames.push(item.key[2] as string);
-
-        // Build online name set from in-memory clients (zero KV reads)
-        const onlineMap = new Map<string, Record<string, unknown>>();
+        const onlineNames = new Set<string>();
+        const onlineMembers = [];
+        // Only include online users who are actually members of this server
         for (const [, ci] of clients) {
-          if (ci.name) onlineMap.set((ci.name as string).toLowerCase(), ci);
+          if (!ci.name) continue;
+          const memCheck = await kv.get(["server_member", svId, ci.name as string]);
+          if (memCheck.value) {
+            onlineNames.add(ci.name as string);
+            onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
+          }
         }
-
-        // Batch-fetch all offline member accounts in parallel (one Promise.all, not N sequential awaits)
-        const offlineNames = memberNames.filter(n => !onlineMap.has(n.toLowerCase()));
-        const offlineAccounts = await Promise.all(
-          offlineNames.map(n => kv.get<Record<string, unknown>>(["accounts", n.toLowerCase()]))
-        );
-
-        const onlineMembers = memberNames
-          .filter(n => onlineMap.has(n.toLowerCase()))
-          .map(n => {
-            const ci = onlineMap.get(n.toLowerCase())!;
-            return { name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true };
-          });
-
-        const offlineMembers = offlineAccounts
-          .map(e => e.value)
-          .filter(Boolean)
-          .map(a => ({ name: a!.name, tag: a!.tag, color: a!.color, pfp: a!.pfp, systemRole: a!.systemRole, coAdmin: a!.coAdmin, online: false }));
-
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: [...onlineMembers, ...offlineMembers] }));
+        const memIter2 = kv.list({ prefix: ["server_member", svId] });
+        const offlineMembers = [];
+        for await (const item of memIter2) {
+          const mName = item.key[2] as string;
+          if (!onlineNames.has(mName)) {
+            const mAcct = await kv.get<Record<string, unknown>>(["accounts", mName.toLowerCase()]);
+            if (mAcct.value) offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
+          }
         }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: [...onlineMembers, ...offlineMembers] }));
         break;
       }
 
@@ -1510,23 +1379,17 @@ Deno.serve((req) => {
           ws.send(JSON.stringify({ type: "error", message: `Your account is frozen: ${freeze.reason}` }));
           break;
         }
-        const dmTo = (msg.to as string || "").trim();
-        const dmFrom = senderName; // BUG B FIX: pin dmFrom to authenticated sender, not msg.from
-        // BUG B FIX: Validate dmTo is non-empty and reasonable length before use.
-        // An empty or missing msg.to caused a crash on .toLowerCase() and stored garbage KV keys.
-        if (!dmTo || dmTo.length > 64) {
-          ws.send(JSON.stringify({ type: "error", message: "Invalid recipient." }));
-          break;
-        }
+        const dmTo = msg.to as string;
+        const dmFrom = msg.from as string;
         // FIX #8: Normalize both sides to lowercase so case-variant names (e.g. after
         // an admin rename) always resolve to the same KV key.
         const dmKey = ["dm_history", [dmFrom.toLowerCase(), dmTo.toLowerCase()].sort().join(":")];
         const existing = await kv.get<unknown[]>(dmKey);
         const hist = existing.value || [];
-        hist.push({ ...msg, from: dmFrom, to: dmTo, _stored: Date.now() });
+        hist.push({ ...msg, _stored: Date.now() });
         if (hist.length > 500) hist.splice(0, hist.length - 500);
         await kv.set(dmKey, hist);
-        sendToUser(dmTo, { ...msg, from: dmFrom, to: dmTo }, true);
+        sendToUser(dmTo, msg, true);
         break;
       }
 
@@ -2254,22 +2117,15 @@ Deno.serve((req) => {
           if ((item.key[2] as string)?.toLowerCase() === nukeTarget) await kv.delete(item.key);
         }
 
-        // 5. Purge all channel messages by this user (chunked parallel writes)
+        // 5. Purge all channel messages by this user
         const nukeChIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
-        const nukeChEntries: { key: Deno.KvKey; value: unknown[] }[] = [];
         for await (const item of nukeChIter) {
-          if (item.value?.length) nukeChEntries.push({ key: item.key, value: item.value });
-        }
-        const NUKE_CHUNK = 20;
-        for (let i = 0; i < nukeChEntries.length; i += NUKE_CHUNK) {
-          await Promise.all(nukeChEntries.slice(i, i + NUKE_CHUNK).map(async ({ key, value }) => {
-            const filtered = value.filter((m: unknown) => (m as Record<string,unknown>).author?.toString().toLowerCase() !== nukeTarget);
-            if (filtered.length !== value.length) {
-              await kv.set(key, filtered);
-              msgHistory.set(key[1] as string, filtered);
-            }
-          }));
-          await new Promise(r => setTimeout(r, 0)); // yield between chunks
+          if (!item.value?.length) continue;
+          const filtered = item.value.filter((m: unknown) => (m as Record<string,unknown>).author?.toString().toLowerCase() !== nukeTarget);
+          if (filtered.length !== item.value.length) {
+            await kv.set(item.key, filtered);
+            msgHistory.set(item.key[1] as string, filtered);
+          }
         }
 
         // 6. Delete DM history involving this user
@@ -2367,36 +2223,23 @@ Deno.serve((req) => {
         if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can send mass DMs." })); break; }
         const massDmText = (msg.text as string || "").trim().slice(0, 2000);
         if (!massDmText) { ws.send(JSON.stringify({ type: "error", message: "Text required." })); break; }
-
-        // Collect all recipients first to avoid holding the iterator open during writes
         const massDmIter = kv.list<Record<string,unknown>>({ prefix: ["accounts"] });
-        const recipients: string[] = [];
-        for await (const item of massDmIter) {
-          const name = item.value?.name as string;
-          if (name && name !== senderName) recipients.push(name);
-        }
-
-        // Process in chunks of 20 parallel KV ops to stay well within CPU burst limits
-        const CHUNK = 20;
         let massDmCount = 0;
-        for (let i = 0; i < recipients.length; i += CHUNK) {
-          const chunk = recipients.slice(i, i + CHUNK);
-          await Promise.all(chunk.map(async (recipient) => {
-            const sysMassMsg = {
-              type: "dm", id: crypto.randomUUID().replace(/-/g,""),
-              from: "System", to: recipient, text: massDmText,
-              ts: Date.now(), authorColor: "#6c63ff", system: true,
-            };
-            const massKey  = ["dm_history", ["system", recipient.toLowerCase()].sort().join(":")];
-            const massHist = (await kv.get<unknown[]>(massKey)).value || [];
-            massHist.push(sysMassMsg);
-            if (massHist.length > 500) massHist.splice(0, massHist.length - 500);
-            await kv.set(massKey, massHist);
-            sendToUser(recipient, sysMassMsg, true);
-          }));
-          massDmCount += chunk.length;
-          // Yield between chunks to avoid CPU burst timeout on large user bases
-          await new Promise(r => setTimeout(r, 0));
+        for await (const item of massDmIter) {
+          const recipient = item.value?.name as string;
+          if (!recipient || recipient === senderName) continue;
+          const sysMassMsg = {
+            type: "dm", id: crypto.randomUUID().replace(/-/g,""),
+            from: "System", to: recipient, text: massDmText,
+            ts: Date.now(), authorColor: "#6c63ff", system: true,
+          };
+          const massKey  = ["dm_history", ["system", recipient.toLowerCase()].sort().join(":")];
+          const massHist = (await kv.get<unknown[]>(massKey)).value || [];
+          massHist.push(sysMassMsg);
+          if (massHist.length > 500) massHist.splice(0, massHist.length - 500);
+          await kv.set(massKey, massHist);
+          sendToUser(recipient, sysMassMsg, true);
+          massDmCount++;
         }
         await auditLog("mass_dm", senderName, { text: massDmText.slice(0,80), recipients: massDmCount });
         ws.send(JSON.stringify({ type: "success", message: `Mass DM sent to ${massDmCount} user(s).` }));
@@ -2576,17 +2419,8 @@ Deno.serve((req) => {
   ws.onclose = () => {
     const info = clientInfo(ws);
     if (info) {
+      broadcast({ type: "member_leave", user: info.name, serverId: "__all__" });
       console.log("Disconnected:", info.name);
-      // Notify each server the user was in — don't broadcast to all 1000 clients
-      const serverIds = info.serverIds as Set<string> | undefined;
-      if (serverIds?.size) {
-        for (const svId of serverIds) {
-          broadcastToServer(svId, { type: "member_leave", user: info.name, serverId: svId }, ws);
-        }
-      } else {
-        // Fallback for clients that disconnected before identify completed
-        broadcast({ type: "member_leave", user: info.name, serverId: "__all__" }, ws);
-      }
       // Remove from any active calls
       const userName = info.name as string;
       for (const [callId, call] of activeCalls) {
