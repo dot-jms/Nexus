@@ -106,6 +106,16 @@ function broadcast(data: unknown, exclude: WebSocket | null = null) {
   }
 }
 
+// Broadcast only to clients who are members of a specific server
+function broadcastToServer(serverId: string, data: unknown, exclude: WebSocket | null = null) {
+  const msg = JSON.stringify(data);
+  for (const [ws, info] of clients) {
+    if (ws === exclude || ws.readyState !== WebSocket.OPEN) continue;
+    const serverIds = info.serverIds as Set<string> | undefined;
+    if (serverIds?.has(serverId)) ws.send(msg);
+  }
+}
+
 function sendToUser(name: string, data: unknown, queue = true): boolean {
   // BUG 4 FIX: offline queue used mixed-case names as keys, causing misses on flush.
   // Normalize to lowercase so sendToUser("Alice") and offline.get("alice") always match.
@@ -517,6 +527,7 @@ Deno.serve((req) => {
         token: msg.token,
         systemRole: acct?.systemRole || "user",
         coAdmin: acct?.coAdmin || false,
+        serverIds: new Set<string>(), // filled below after userSvIds is loaded
       });
 
       // Re-persist the session token in case KV was wiped (e.g. new database attached)
@@ -571,6 +582,10 @@ Deno.serve((req) => {
 
       console.log(`[identify] user=${name} (key=${tokenUser}) user_servers=${JSON.stringify(userSvIdsEntry.value)}`);
       const userSvIds = userSvIdsEntry.value || [];
+
+      // Store server membership on client info for scoped broadcasting
+      const clientInfo2 = clients.get(ws);
+      if (clientInfo2) (clientInfo2 as Record<string, unknown>).serverIds = new Set(userSvIds);
 
       const userServers: Record<string, unknown>[] = [];
       for (const svId of userSvIds) {
@@ -640,6 +655,20 @@ Deno.serve((req) => {
         offline.delete(tokenUser);
         offline.delete(name.toLowerCase());
       }
+
+      // Broadcast member_join to all servers this user belongs to
+      // so other online members see them come online immediately
+      for (const svId of userSvIds) {
+        broadcastToServer(svId, {
+          type: "member_join",
+          serverId: svId,
+          user: acct?.name || name,
+          color: acct?.color || "#6c63ff",
+          pfp: acct?.pfp || null,
+          tag: acct?.tag || "0000",
+        }, ws);
+      }
+
       return;
     }
 
@@ -1287,6 +1316,12 @@ Deno.serve((req) => {
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         // FIX: Use helper to ensure consistent lowercase key
         await addServerToUser(senderName, msg.serverId as string);
+        // Track in client's in-memory serverIds so broadcastToServer works immediately
+        const joiningInfo = clients.get(ws);
+        if (joiningInfo) {
+          if (!(joiningInfo as Record<string,unknown>).serverIds) (joiningInfo as Record<string,unknown>).serverIds = new Set();
+          ((joiningInfo as Record<string,unknown>).serverIds as Set<string>).add(msg.serverId as string);
+        }
         broadcast(msg, ws);
         break;
       }
