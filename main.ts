@@ -822,6 +822,11 @@ Deno.serve((req) => {
         break;
       }
 
+      case "ping":
+        // Keepalive — reply immediately so client knows connection is alive
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
+        break;
+
       case "typing":
       case "member_join":
       case "member_leave":
@@ -996,7 +1001,6 @@ Deno.serve((req) => {
       }
 
       case "vcall_invite": {
-        // Track the call so admins can list/join it
         const inviteCallId = msg.callId as string;
         if (inviteCallId) {
           if (!activeCalls.has(inviteCallId)) {
@@ -1004,7 +1008,7 @@ Deno.serve((req) => {
           }
           activeCalls.get(inviteCallId)!.participants.add(senderName);
         }
-        sendToUser(msg.to as string, msg, true);
+        sendToUser(msg.to as string, msg, false); // never queue call invites
         break;
       }
       case "vcall_accept": {
@@ -1012,12 +1016,14 @@ Deno.serve((req) => {
         if (acceptCallId && activeCalls.has(acceptCallId)) {
           activeCalls.get(acceptCallId)!.participants.add(senderName);
         }
-        sendToUser(msg.to as string, msg, true);
+        sendToUser(msg.to as string, msg, false); // never queue
         break;
       }
       case "vcall_decline":
       case "vcall_signal": {
-        sendToUser(msg.to as string, msg, true);
+        // Never queue signals — stale ICE candidates arriving after negotiation
+        // completes will corrupt the connection. Fire-and-forget only.
+        sendToUser(msg.to as string, msg, false);
         break;
       }
       case "vcall_end": {
