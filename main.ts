@@ -579,6 +579,16 @@ Deno.serve((req) => {
         console.log(`[identify] svId=${svId} found=${!!svEntry.value}`);
         if (svEntry.value) {
           const sv = svEntry.value;
+          // Load pins for all channels in this server
+          const svPins: Record<string, unknown[]> = {};
+          for (const ch of (sv.channels as Array<{ id: string }> || [])) {
+            const pinData = (await kv.get<unknown[]>(["pins", svId, ch.id])).value;
+            if (pinData?.length) svPins[ch.id] = pinData;
+          }
+          // Load shorts metadata (no video data — just url/caption/author/likes/comments)
+          const shortsData = (await kv.get<unknown[]>(["shorts", svId])).value || [];
+          // Load custom emoji names list (data is p2p — too large for free tier KV)
+          const emojiNames = (await kv.get<string[]>(["custom_emoji_names", svId])).value || [];
           userServers.push({
             id: sv.id, name: sv.name, desc: sv.desc || "",
             color: sv.color || "#6c63ff",
@@ -588,12 +598,20 @@ Deno.serve((req) => {
             memberCount: sv.memberCount || 1,
             createdAt: sv.createdAt || 0,
             isPublic: sv.isPublic !== false,
+            pins: svPins,
+            shorts: shortsData,
+            customEmojiNames: emojiNames, // names only — data fetched p2p via emoji_request
           });
         }
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
 
-      const friendsList = (await kv.get(["friends", tokenUser])).value || [];
+      const friendsRaw = ((await kv.get<unknown[]>(["friends", tokenUser])).value || []) as Record<string, unknown>[];
+      // Enrich friends with current pfp from their account records
+      const friendsList = await Promise.all(friendsRaw.map(async f => {
+        const fAcct = await kv.get<Record<string, unknown>>(["accounts", (f.name as string || "").toLowerCase()]);
+        return { ...f, pfp: fAcct.value?.pfp || f.pfp || null, color: fAcct.value?.color || f.color || null };
+      }));
       const pendingReqs: unknown[] = [];
       const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
       for await (const item of reqIter) pendingReqs.push(item.value);
@@ -629,6 +647,34 @@ Deno.serve((req) => {
         if (frozenUsers.has(tokenUser)) {
           const fz = frozenUsers.get(tokenUser)!;
           ws.send(JSON.stringify({ type: "account_frozen", reason: fz.reason, by: fz.by }));
+        }
+
+        // Send DM contacts so the client can restore its DM sidebar even after a cache clear.
+        // Scan all dm_history keys that include this user and return the other party's info.
+        {
+          const dmContactsMap = new Map<string, { name: string; lastTs: number; last: string; pfp: string | null }>();
+          const dmScanIter = kv.list<unknown[]>({ prefix: ["dm_history"] });
+          for await (const item of dmScanIter) {
+            const keyStr = item.key[1] as string;
+            const parts = keyStr.split(":");
+            if (!parts.some(p => p === tokenUser)) continue;
+            const otherLower = parts.find(p => p !== tokenUser) || "";
+            if (!otherLower || dmContactsMap.has(otherLower)) continue;
+            const msgs = item.value || [];
+            const last = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
+            const otherAcct = await kv.get<Record<string, unknown>>(["accounts", otherLower]);
+            const displayName = (otherAcct.value?.name as string) || otherLower;
+            dmContactsMap.set(otherLower, {
+              name: displayName,
+              lastTs: (last?._stored as number || last?.ts as number || 0),
+              last: (last?.text as string || (Array.isArray((last as Record<string,unknown>)?.attachments) ? "[attachment]" : "")),
+              pfp: (otherAcct.value?.pfp as string | null) ?? null,
+            });
+          }
+          if (dmContactsMap.size > 0) {
+            const contacts = [...dmContactsMap.values()].sort((a, b) => b.lastTs - a.lastTs);
+            ws.send(JSON.stringify({ type: "dm_contacts", contacts }));
+          }
         }
       }
 
@@ -785,11 +831,21 @@ Deno.serve((req) => {
       const safeColor = /^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/.test(rawColor)
         ? rawColor
         : (entry.value?.color as string || "#6c63ff");
+      const safeBio = (msg.bio as string ?? (entry.value?.bio as string) ?? "").slice(0, 160);
       if (entry.value) {
-        await kv.set(key, { ...entry.value, color: safeColor, pfp: msg.pfp !== undefined ? msg.pfp : entry.value.pfp, bio: msg.bio ?? entry.value.bio, socials: msg.socials ?? entry.value.socials });
+        await kv.set(key, { ...entry.value, color: safeColor, pfp: msg.pfp !== undefined ? msg.pfp : entry.value.pfp, bio: safeBio, socials: msg.socials ?? entry.value.socials });
       }
-      if (info) { (info as Record<string, unknown>).color = safeColor; (info as Record<string, unknown>).pfp = msg.pfp; }
-      broadcast({ ...msg, color: safeColor }, ws);
+      if (info) {
+        (info as Record<string, unknown>).color = safeColor;
+        (info as Record<string, unknown>).pfp = msg.pfp;
+        (info as Record<string, unknown>).bio = safeBio;
+      }
+      // Broadcast to all OTHER clients (they need to update their caches/renders)
+      broadcast({ ...msg, color: safeColor, bio: safeBio }, ws);
+      // Also confirm back to sender with the authoritative values (color may have been sanitized)
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "profile_update_confirm", color: safeColor, pfp: msg.pfp ?? null, bio: safeBio, socials: msg.socials ?? {} }));
+      }
       return;
     }
 
@@ -828,14 +884,14 @@ Deno.serve((req) => {
         const chKey = ["ch_history", msg.channelId as string];
         const chEntry = await kv.get<unknown[]>(chKey);
         const chHist = chEntry.value || [];
-        // Strip base64 image/video/audio data before persisting to KV to avoid the 65536-byte
-        // per-value limit. Attachments with data URLs are trimmed to a placeholder.
+        // Strip base64 image/video/audio data before persisting to KV.
+        // Deno free tier has a 64 KB per-value limit — base64 attachments can be several MB.
+        // Live recipients get the full data via broadcast below; late-joiners use p2p video_request.
         const msgToStore = { ...(msg as Record<string,unknown>) };
         if (Array.isArray(msgToStore.attachments)) {
           msgToStore.attachments = (msgToStore.attachments as Record<string,unknown>[]).map(att => {
             const url = att.url as string || "";
             if (url.startsWith("data:")) {
-              // Keep metadata but drop the binary data — clients who loaded the message keep it cached
               return { ...att, url: "", _stripped: true };
             }
             return att;
@@ -877,9 +933,39 @@ Deno.serve((req) => {
       case "member_leave":
       case "kick_member":
       case "status_update":
-      case "pin_message":
         broadcast(msg, ws);
         break;
+
+      case "pin_message": {
+        // Persist to KV so pins survive cache clears
+        const pinSvId = msg.serverId as string;
+        const pinChId = msg.channelId as string;
+        if (pinSvId && pinChId) {
+          const pinKey = ["pins", pinSvId, pinChId];
+          const pinEntry = await kv.get<unknown[]>(pinKey);
+          const pinList = (pinEntry.value || []) as Record<string, unknown>[];
+          if (!pinList.find(p => p.id === msg.msgId)) {
+            pinList.push({ id: msg.msgId, text: msg.text, author: msg.author, ts: msg.ts });
+            await kv.set(pinKey, pinList);
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "unpin_message": {
+        const unpinSvId = msg.serverId as string;
+        const unpinChId = msg.channelId as string;
+        if (unpinSvId && unpinChId) {
+          const unpinKey = ["pins", unpinSvId, unpinChId];
+          const unpinEntry = await kv.get<unknown[]>(unpinKey);
+          if (unpinEntry.value) {
+            await kv.set(unpinKey, (unpinEntry.value as Record<string, unknown>[]).filter(p => p.id !== msg.msgId));
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
 
       case "channel_add": {
         // Regular user adds a channel to their own server — writes directly to KV
@@ -1002,6 +1088,7 @@ Deno.serve((req) => {
           }
           const filtered = delEntry.value.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId);
           await kv.set(delKey, filtered);
+        }
         }
         // Also remove from in-memory cache
         const delMem = msgHistory.get(delChId);
@@ -1452,26 +1539,89 @@ Deno.serve((req) => {
         break;
       }
 
+      case "fetch_dm_contacts": {
+        // Return all DM contacts for this user so the client can rebuild its sidebar after a cache clear.
+        const dmContactsMap2 = new Map<string, { name: string; lastTs: number; last: string; pfp: string | null }>();
+        const dmContactsIter = kv.list<unknown[]>({ prefix: ["dm_history"] });
+        for await (const item of dmContactsIter) {
+          const keyStr = item.key[1] as string;
+          const parts = keyStr.split(":");
+          if (!parts.some(p => p === senderName.toLowerCase())) continue;
+          const otherLower = parts.find(p => p !== senderName.toLowerCase()) || "";
+          if (!otherLower || dmContactsMap2.has(otherLower)) continue;
+          const msgs = item.value || [];
+          const last = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
+          const otherAcct = await kv.get<Record<string, unknown>>(["accounts", otherLower]);
+          const displayName = (otherAcct.value?.name as string) || otherLower;
+          dmContactsMap2.set(otherLower, {
+            name: displayName,
+            lastTs: (last?._stored as number || last?.ts as number || 0),
+            last: (last?.text as string || (Array.isArray((last as Record<string,unknown>)?.attachments) ? "[attachment]" : "")),
+            pfp: (otherAcct.value?.pfp as string | null) ?? null,
+          });
+        }
+        const contacts2 = [...dmContactsMap2.values()].sort((a, b) => b.lastTs - a.lastTs);
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "dm_contacts", contacts: contacts2 }));
+        break;
+      }
+
       case "get_members": {
         const svId = msg.serverId as string;
-        const onlineNames = new Set<string>();
+        const onlineNamesLower = new Set<string>();
         const onlineMembers = [];
         // Only include online users who are actually members of this server
         for (const [, ci] of clients) {
           if (!ci.name) continue;
+          // Check case-insensitively — server_member keys may have been stored with original case
+          const nameLower = (ci.name as string).toLowerCase();
           const memCheck = await kv.get(["server_member", svId, ci.name as string]);
-          if (memCheck.value) {
-            onlineNames.add(ci.name as string);
-            onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
+          // Also try lowercase variant in case of legacy key
+          const memCheckLower = memCheck.value ? memCheck : await kv.get(["server_member", svId, nameLower]);
+          if (memCheck.value || memCheckLower.value) {
+            if (!onlineNamesLower.has(nameLower)) {
+              onlineNamesLower.add(nameLower);
+              onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
+            }
           }
         }
         const memIter2 = kv.list({ prefix: ["server_member", svId] });
         const offlineMembers = [];
+        const allKnownLower = new Set(onlineNamesLower);
         for await (const item of memIter2) {
           const mName = item.key[2] as string;
-          if (!onlineNames.has(mName)) {
-            const mAcct = await kv.get<Record<string, unknown>>(["accounts", mName.toLowerCase()]);
+          const mNameLower = mName.toLowerCase();
+          if (!allKnownLower.has(mNameLower)) {
+            allKnownLower.add(mNameLower);
+            const mAcct = await kv.get<Record<string, unknown>>(["accounts", mNameLower]);
             if (mAcct.value) offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
+          }
+        }
+        // Ghost-member sweep: scan recent channel history for message authors not in the list.
+        // If someone chatted here but isn't in server_member (data inconsistency / migration gap),
+        // add them to the offline list and back-fill their membership so future lookups are correct.
+        const svEntry4 = await kv.get<Record<string,unknown>>(["servers", svId]);
+        const svChannels4 = (svEntry4.value?.channels as Array<{ id: string }>) || [];
+        for (const ch of svChannels4) {
+          const chHist4 = (await kv.get<unknown[]>(["ch_history", ch.id])).value || [];
+          for (const m of chHist4) {
+            const mm = m as Record<string, unknown>;
+            const authorRaw = mm.author as string | undefined;
+            if (!authorRaw) continue;
+            const authorLower = authorRaw.toLowerCase();
+            if (allKnownLower.has(authorLower)) continue;
+            allKnownLower.add(authorLower);
+            const ghostAcct = await kv.get<Record<string, unknown>>(["accounts", authorLower]);
+            if (!ghostAcct.value) continue;
+            // Back-fill server membership so this user shows up correctly going forward
+            await kv.set(["server_member", svId, ghostAcct.value.name as string], { joinedAt: Date.now(), addedBy: "ghost-sweep" });
+            await addServerToUser(authorLower, svId);
+            const isOnline = [...clients.values()].some(ci => (ci.name as string)?.toLowerCase() === authorLower);
+            if (isOnline) {
+              onlineMembers.push({ name: ghostAcct.value.name, tag: ghostAcct.value.tag, color: ghostAcct.value.color, pfp: ghostAcct.value.pfp, systemRole: ghostAcct.value.systemRole, coAdmin: ghostAcct.value.coAdmin, online: true });
+            } else {
+              offlineMembers.push({ name: ghostAcct.value.name, tag: ghostAcct.value.tag, color: ghostAcct.value.color, pfp: ghostAcct.value.pfp, systemRole: ghostAcct.value.systemRole, coAdmin: ghostAcct.value.coAdmin, online: false });
+            }
+            console.log(`[ghost-sweep] added missing member ${authorLower} to server ${svId}`);
           }
         }
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: [...onlineMembers, ...offlineMembers] }));
@@ -1502,11 +1652,65 @@ Deno.serve((req) => {
       case "dm_request":
       case "dm_accept":
       case "dm_decline":
-      case "friend_request":
-      case "friend_accept":
-      case "friend_decline":
         sendToUser(msg.to as string, msg, true);
         break;
+
+      case "friend_request": {
+        // Store the incoming request in KV so the recipient gets it even if they're offline
+        const frTo = (msg.to as string || "").toLowerCase();
+        if (!frTo) break;
+        const frKey = ["friend_requests", frTo, senderName.toLowerCase()];
+        await kv.set(frKey, { from: senderName, fromPfp: msg.fromPfp || null, fromColor: msg.fromColor || null, ts: Date.now() });
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_accept": {
+        const faTo = (msg.to as string || "").toLowerCase();
+        if (!faTo) break;
+        // Delete the pending request from KV
+        await kv.delete(["friend_requests", senderName.toLowerCase(), faTo]);
+        await kv.delete(["friend_requests", faTo, senderName.toLowerCase()]);
+        // Add each user to the other's friends list in KV
+        const faMyKey = ["friends", senderName.toLowerCase()];
+        const faTheirKey = ["friends", faTo];
+        const faMyList = ((await kv.get<unknown[]>(faMyKey)).value || []) as Record<string, unknown>[];
+        const faTheirList = ((await kv.get<unknown[]>(faTheirKey)).value || []) as Record<string, unknown>[];
+        if (!faMyList.find(f => (f.name as string)?.toLowerCase() === faTo)) {
+          faMyList.push({ name: msg.to, pfp: null, color: null });
+          await kv.set(faMyKey, faMyList);
+        }
+        if (!faTheirList.find(f => (f.name as string)?.toLowerCase() === senderName.toLowerCase())) {
+          faTheirList.push({ name: senderName, pfp: msg.fromPfp || null, color: msg.fromColor || null });
+          await kv.set(faTheirKey, faTheirList);
+        }
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_decline": {
+        const fdTo = (msg.to as string || "").toLowerCase();
+        // Remove the pending request from KV
+        await kv.delete(["friend_requests", senderName.toLowerCase(), fdTo]);
+        await kv.delete(["friend_requests", fdTo, senderName.toLowerCase()]);
+        sendToUser(msg.to as string, msg, true);
+        break;
+      }
+
+      case "friend_remove": {
+        const frmTarget = (msg.target as string || "").toLowerCase();
+        if (!frmTarget) break;
+        // Remove from both sides in KV
+        const frmMyKey = ["friends", senderName.toLowerCase()];
+        const frmTheirKey = ["friends", frmTarget];
+        const frmMyList = ((await kv.get<unknown[]>(frmMyKey)).value || []) as Record<string, unknown>[];
+        const frmTheirList = ((await kv.get<unknown[]>(frmTheirKey)).value || []) as Record<string, unknown>[];
+        await kv.set(frmMyKey, frmMyList.filter(f => (f.name as string)?.toLowerCase() !== frmTarget));
+        await kv.set(frmTheirKey, frmTheirList.filter(f => (f.name as string)?.toLowerCase() !== senderName.toLowerCase()));
+        // Notify the other user if online
+        sendToUser(msg.target as string, { type: "friend_removed", by: senderName }, false);
+        break;
+      }
 
       case "dm_delete": {
         // Delete a DM message from KV history and notify the other party
@@ -1563,12 +1767,93 @@ Deno.serve((req) => {
         break;
       }
 
-      case "short_post":
-      case "short_like":
-      case "short_comment":
-      case "custom_emoji_add":
+      case "short_post": {
+        // Save short metadata to KV — no video data stored (URL-based, or p2p for uploads)
+        const spSvId = msg.serverId as string;
+        if (spSvId && msg.short) {
+          const spKey = ["shorts", spSvId];
+          const spList = ((await kv.get<unknown[]>(spKey)).value || []) as Record<string, unknown>[];
+          const spShort = msg.short as Record<string, unknown>;
+          // Strip any base64 video data — shorts should use external URLs or p2p
+          const spToStore = { ...spShort };
+          if (typeof spToStore.url === "string" && spToStore.url.startsWith("data:")) {
+            spToStore.url = ""; spToStore._stripped = true;
+          }
+          if (!spList.find(s => s.id === spToStore.id)) {
+            spList.push(spToStore);
+            if (spList.length > 200) spList.splice(0, spList.length - 200);
+            await kv.set(spKey, spList);
+          }
+        }
         broadcast(msg, ws);
         break;
+      }
+
+      case "short_like": {
+        const slSvId = msg.serverId as string;
+        const slId = msg.shortId as string;
+        if (slSvId && slId) {
+          const slKey = ["shorts", slSvId];
+          const slList = ((await kv.get<unknown[]>(slKey)).value || []) as Record<string, unknown>[];
+          const slShort = slList.find(s => s.id === slId) as Record<string, unknown> | undefined;
+          if (slShort) {
+            const slLikes = (slShort.likes as string[] || []);
+            const slUser = msg.user as string;
+            if (msg.liked && !slLikes.includes(slUser)) slLikes.push(slUser);
+            else if (!msg.liked) slShort.likes = slLikes.filter(u => u !== slUser);
+            if (msg.liked) slShort.likes = slLikes;
+            await kv.set(slKey, slList);
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "short_comment": {
+        const scSvId = msg.serverId as string;
+        const scId = msg.shortId as string;
+        if (scSvId && scId && msg.comment) {
+          const scKey = ["shorts", scSvId];
+          const scList = ((await kv.get<unknown[]>(scKey)).value || []) as Record<string, unknown>[];
+          const scShort = scList.find(s => s.id === scId) as Record<string, unknown> | undefined;
+          if (scShort) {
+            if (!Array.isArray(scShort.comments)) scShort.comments = [];
+            (scShort.comments as unknown[]).push(msg.comment);
+            await kv.set(scKey, scList);
+          }
+        }
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "custom_emoji_add": {
+        // Store the emoji name in KV (data is too large for free-tier KV — p2p like videos)
+        const ceSvId = msg.serverId as string;
+        const ceName = msg.name as string;
+        if (ceSvId && ceName) {
+          const ceNamesKey = ["custom_emoji_names", ceSvId];
+          const ceNames = ((await kv.get<string[]>(ceNamesKey)).value || []);
+          if (!ceNames.includes(ceName)) {
+            ceNames.push(ceName);
+            await kv.set(ceNamesKey, ceNames);
+          }
+        }
+        // Broadcast full msg including data to live clients (they cache it locally)
+        broadcast(msg, ws);
+        break;
+      }
+
+      case "emoji_request": {
+        // P2P relay: someone needs an emoji's data — broadcast to server so a caching peer responds
+        broadcastToServer(msg.serverId as string, msg, ws);
+        break;
+      }
+
+      case "emoji_serve": {
+        // A peer is serving emoji data directly to the requester
+        sendToUser(msg.to as string, msg, false);
+        break;
+      }
 
       case "admin_dm_response": {
         // FIX #5: Only power users should be able to submit DM responses — a regular
