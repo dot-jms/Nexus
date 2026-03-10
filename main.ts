@@ -892,6 +892,44 @@ Deno.serve((req) => {
       case "kick_member":
       case "status_update":
       case "pin_message":
+
+      case "channel_add": {
+        // Regular user adds a channel to their own server — writes directly to KV
+        const caSvId = (msg.serverId as string || "").trim();
+        const caCh   = msg.channel as Record<string, unknown>;
+        if (!caSvId || !caCh?.id || !caCh?.name) break;
+        const caEntry = await kv.get<Record<string, unknown>>(["servers", caSvId]);
+        if (!caEntry.value) break;
+        // Permission check: sender must be owner or admin
+        const caOwnerLower = (caEntry.value.ownerIdLower as string || (caEntry.value.ownerId as string || "").toLowerCase());
+        if (caOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        const caChannels = [...((caEntry.value.channels as unknown[]) || []), caCh];
+        const caUpdated  = { ...caEntry.value, channels: caChannels };
+        await kv.set(["servers", caSvId], caUpdated);
+        if (publicServers.has(caSvId)) publicServers.set(caSvId, caUpdated);
+        broadcastToServer(caSvId, { type: "server_channel_added", serverId: caSvId, channel: caCh, by: senderName }, null);
+        break;
+      }
+
+      case "channel_remove": {
+        // Regular user removes a channel from their own server
+        const crSvId = (msg.serverId as string || "").trim();
+        const crChId = (msg.channelId as string || "").trim();
+        if (!crSvId || !crChId) break;
+        const crEntry = await kv.get<Record<string, unknown>>(["servers", crSvId]);
+        if (!crEntry.value) break;
+        const crOwnerLower = (crEntry.value.ownerIdLower as string || (crEntry.value.ownerId as string || "").toLowerCase());
+        if (crOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        const crChannels = ((crEntry.value.channels as unknown[]) || []).filter((c: unknown) => (c as Record<string,unknown>).id !== crChId);
+        const crUpdated  = { ...crEntry.value, channels: crChannels };
+        await kv.set(["servers", crSvId], crUpdated);
+        if (publicServers.has(crSvId)) publicServers.set(crSvId, crUpdated);
+        await kv.delete(["ch_history", crChId]);
+        msgHistory.delete(crChId);
+        broadcastToServer(crSvId, { type: "server_channel_removed", serverId: crSvId, channelId: crChId, by: senderName }, null);
+        break;
+      }
+
       case "channel_delete":
         broadcast(msg, ws);
         break;
@@ -1734,8 +1772,7 @@ Deno.serve((req) => {
         const updatedSvTo = { ...toEntry.value, ownerId: toNewDisplayName, ownerIdLower: toNewOwner.toLowerCase() };
         await kv.set(["servers", toSvId], updatedSvTo);
         if (publicServers.has(toSvId)) publicServers.set(toSvId, updatedSvTo);
-        // Include full server data so new owner can add to sidebar if not already joined
-        broadcast({ type: "server_ownership_transfer", serverId: toSvId, newOwner: toNewDisplayName, by: senderName, server: updatedSvTo }, null);
+        broadcast({ type: "server_ownership_transfer", serverId: toSvId, newOwner: toNewDisplayName, by: senderName }, null);
         ws.send(JSON.stringify({ type: "success", message: `Ownership of server transferred to ${toNewDisplayName}.` }));
         console.log(`[admin] ${senderName} transferred ownership of ${toSvId} to ${toNewDisplayName}`);
         break;
