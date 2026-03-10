@@ -350,23 +350,9 @@ Deno.serve((req) => {
       if (existing.value) {
         ws.send(JSON.stringify({ type: "auth_error", message: "That username is already taken. Choose another." })); return;
       }
-      // BUG 11 FIX: Tag collision - with 9999 possible values and many accounts,
-      // random tags will eventually collide. Loop until a unique one is found.
-      let tag = String(Math.floor(Math.random() * 9999)).padStart(4, "0");
-      {
-        let attempts = 0;
-        while (attempts < 20) {
-          const tagCheck = await kv.list({ prefix: ["accounts"] });
-          let taken = false;
-          for await (const item of tagCheck) {
-            const a = item.value as Record<string, unknown>;
-            if ((a.name as string || "").toLowerCase() === username.toLowerCase() && a.tag === tag) { taken = true; break; }
-          }
-          if (!taken) break;
-          tag = String(Math.floor(Math.random() * 9999)).padStart(4, "0");
-          attempts++;
-        }
-      }
+      // Tags are decorative discriminators (like Discord's #XXXX). Since usernames
+      // are already unique as KV keys, a simple random assignment is sufficient.
+      const tag = String(Math.floor(Math.random() * 9999) + 1).padStart(4, "0");
       const acct = {
         name: username,
         tag,
@@ -892,6 +878,8 @@ Deno.serve((req) => {
       case "kick_member":
       case "status_update":
       case "pin_message":
+        broadcast(msg, ws);
+        break;
 
       case "channel_add": {
         // Regular user adds a channel to their own server — writes directly to KV
@@ -930,9 +918,21 @@ Deno.serve((req) => {
         break;
       }
 
-      case "channel_delete":
+      case "channel_delete": {
+        // Legacy client-side deletion signal — gate it behind ownership just like channel_remove
+        const cdSvId = (msg.serverId as string || "").trim();
+        if (cdSvId) {
+          const cdEntry = await kv.get<Record<string, unknown>>(["servers", cdSvId]);
+          if (cdEntry.value) {
+            const cdOwnerLower = (cdEntry.value.ownerIdLower as string || (cdEntry.value.ownerId as string || "").toLowerCase());
+            if (cdOwnerLower !== senderName.toLowerCase() && !isPowerUser) break;
+          }
+        } else if (!isPowerUser) {
+          break; // no serverId and not a power user — reject silently
+        }
         broadcast(msg, ws);
         break;
+      }
 
       case "video_request": {
         // Broadcast only to server members — anyone who has this video cached will respond
@@ -994,6 +994,12 @@ Deno.serve((req) => {
         const delKey = ["ch_history", delChId];
         const delEntry = await kv.get<unknown[]>(delKey);
         if (delEntry.value) {
+          // Only the message author or a power user may delete
+          const delMsg = delEntry.value.find((m: unknown) => (m as Record<string,unknown>).id === delMsgId) as Record<string,unknown> | undefined;
+          if (delMsg && delMsg.author !== senderName && !isPowerUser) {
+            ws.send(JSON.stringify({ type: "error", message: "You can only delete your own messages." }));
+            break;
+          }
           const filtered = delEntry.value.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId);
           await kv.set(delKey, filtered);
         }
@@ -1010,6 +1016,7 @@ Deno.serve((req) => {
         const editMsgId = msg.messageId as string;
         const editKey = ["ch_history", editChId];
         const editEntry = await kv.get<unknown[]>(editKey);
+        let editApplied = false;
         if (editEntry.value) {
           const editHist = editEntry.value as Record<string,unknown>[];
           const editMsg = editHist.find((m: Record<string,unknown>) => m.id === editMsgId);
@@ -1017,9 +1024,11 @@ Deno.serve((req) => {
             editMsg.text = (msg.text as string || "").slice(0, 4000);
             editMsg.edited = true;
             await kv.set(editKey, editHist);
+            editApplied = true;
           }
         }
-        broadcast(msg, ws);
+        if (editApplied) broadcast(msg, ws);
+        else ws.send(JSON.stringify({ type: "error", message: "You can only edit your own messages." }));
         break;
       }
 
@@ -1047,6 +1056,12 @@ Deno.serve((req) => {
         const raEntry = await kv.get<Record<string,unknown>>(raKey);
         if (raEntry.value) {
           const stored = raEntry.value;
+          // Permission check: only server owner or platform admin/co-admin may assign roles
+          const raOwnerLower = (stored.ownerIdLower as string || (stored.ownerId as string || "").toLowerCase());
+          if (raOwnerLower !== senderName.toLowerCase() && !isPowerUser) {
+            ws.send(JSON.stringify({ type: "error", message: "Only the server owner or an admin can assign roles." }));
+            break;
+          }
           const memberRoles = (stored.memberRoles as Record<string,string> || {});
           if (msg.role === 'member' || !msg.role) {
             delete memberRoles[msg.target as string];
@@ -1101,9 +1116,9 @@ Deno.serve((req) => {
       }
 
       case "voice_signal": {
-        const target = msg.to as string;
+        const target = (msg.to as string || "").toLowerCase();
         for (const [tws, ci] of clients) {
-          if (ci.name === target && tws.readyState === WebSocket.OPEN) {
+          if ((ci.name as string)?.toLowerCase() === target && tws.readyState === WebSocket.OPEN) {
             tws.send(JSON.stringify(msg));
           }
         }
@@ -1354,16 +1369,26 @@ Deno.serve((req) => {
       }
 
       case "join_server": {
-        const sv = publicServers.get(msg.serverId as string);
-        if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", msg.serverId as string], sv); }
-        await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
+        const jsvId = msg.serverId as string;
+        // Look up the server — fall back to KV if not in the public cache (e.g. private servers)
+        const jsvEntry = await kv.get<Record<string,unknown>>(["servers", jsvId]);
+        const jsv = jsvEntry.value;
+        if (!jsv) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        // Non-power-users may only join public servers
+        if (jsv.isPublic === false && !isPowerUser) {
+          ws.send(JSON.stringify({ type: "error", message: "That server is private." }));
+          break;
+        }
+        const sv = publicServers.get(jsvId);
+        if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", jsvId], sv); }
+        await kv.set(["server_member", jsvId, senderName], { joinedAt: Date.now() });
         // FIX: Use helper to ensure consistent lowercase key
-        await addServerToUser(senderName, msg.serverId as string);
+        await addServerToUser(senderName, jsvId);
         // Track in client's in-memory serverIds so broadcastToServer works immediately
         const joiningInfo = clients.get(ws);
         if (joiningInfo) {
           if (!(joiningInfo as Record<string,unknown>).serverIds) (joiningInfo as Record<string,unknown>).serverIds = new Set();
-          ((joiningInfo as Record<string,unknown>).serverIds as Set<string>).add(msg.serverId as string);
+          ((joiningInfo as Record<string,unknown>).serverIds as Set<string>).add(jsvId);
         }
         broadcast(msg, ws);
         break;
@@ -1483,6 +1508,61 @@ Deno.serve((req) => {
         sendToUser(msg.to as string, msg, true);
         break;
 
+      case "dm_delete": {
+        // Delete a DM message from KV history and notify the other party
+        const dmdTo  = (msg.to as string || "").toLowerCase();
+        const dmdId  = msg.messageId as string;
+        if (!dmdTo || !dmdId) break;
+        const dmdKey   = ["dm_history", [senderName.toLowerCase(), dmdTo].sort().join(":")];
+        const dmdEntry = await kv.get<unknown[]>(dmdKey);
+        if (dmdEntry.value) {
+          const dmdMsg = dmdEntry.value.find((m: unknown) => (m as Record<string,unknown>).id === dmdId) as Record<string,unknown> | undefined;
+          // Only the message author or a power user may delete
+          if (dmdMsg && dmdMsg.from !== senderName && !isPowerUser) {
+            ws.send(JSON.stringify({ type: "error", message: "You can only delete your own messages." }));
+            break;
+          }
+          const filtered = dmdEntry.value.filter((m: unknown) => (m as Record<string,unknown>).id !== dmdId);
+          await kv.set(dmdKey, filtered);
+        }
+        // Notify the other participant so they remove it from their view too
+        sendToUser(msg.to as string, msg, false);
+        break;
+      }
+
+      case "dm_reaction": {
+        // Persist a reaction toggle to DM history and forward to the other party
+        const dmrTo  = (msg.to as string || "").toLowerCase();
+        const dmrId  = msg.messageId as string;
+        const dmrEmoji = msg.emoji as string;
+        if (!dmrTo || !dmrId || !dmrEmoji) break;
+        const dmrKey   = ["dm_history", [senderName.toLowerCase(), dmrTo].sort().join(":")];
+        const dmrEntry = await kv.get<unknown[]>(dmrKey);
+        if (dmrEntry.value) {
+          const dmrHist = dmrEntry.value as Record<string,unknown>[];
+          const dmrMsg  = dmrHist.find((m: Record<string,unknown>) => m.id === dmrId);
+          if (dmrMsg) {
+            const reacts = (dmrMsg.reactions as Record<string,unknown>[] || []);
+            let rr = reacts.find((x: Record<string,unknown>) => x.emoji === dmrEmoji) as Record<string,unknown>;
+            if (rr) {
+              const users = (rr.users as string[] || []);
+              if (users.includes(senderName)) {
+                rr.count = (rr.count as number) - 1;
+                rr.users = users.filter(u => u !== senderName);
+                if ((rr.count as number) <= 0) dmrMsg.reactions = reacts.filter((x: Record<string,unknown>) => x.emoji !== dmrEmoji);
+              } else { rr.count = (rr.count as number) + 1; rr.users = [...users, senderName]; }
+            } else {
+              reacts.push({ emoji: dmrEmoji, count: 1, users: [senderName] });
+              dmrMsg.reactions = reacts;
+            }
+            await kv.set(dmrKey, dmrHist);
+          }
+        }
+        // Forward to the other participant so their view updates live
+        sendToUser(msg.to as string, msg, false);
+        break;
+      }
+
       case "short_post":
       case "short_like":
       case "short_comment":
@@ -1600,6 +1680,15 @@ Deno.serve((req) => {
           }
         }
         broadcast({ type: "admin_rename_ok", oldName: target, newName }, null);
+
+        // 7. Migrate in-memory offline queue so queued messages reach the renamed user
+        const offlineQueue = offline.get(targetLower);
+        if (offlineQueue?.length) {
+          offline.set(newNameLower, [...(offline.get(newNameLower) || []), ...offlineQueue]);
+          offline.delete(targetLower);
+          console.log(`[rename] migrated ${offlineQueue.length} queued offline message(s) to ${newNameLower}`);
+        }
+
         ws.send(JSON.stringify({ type: "success", message: `${target} renamed to ${newName}.` }));
         break;
       }
@@ -2282,7 +2371,8 @@ Deno.serve((req) => {
         }
         broadcast({ type: "maintenance_update", enabled: maintenanceMode, by: senderName }, null);
         if (maintenanceMode) {
-          // Kick all non-admins
+          // Kick everyone except the platform admin (systemRole === "admin")
+          // Co-admins have systemRole === "user" so they are correctly kicked here
           let kicked = 0;
           for (const [cws, ci] of clients) {
             if (ci.systemRole !== "admin") {
@@ -2429,10 +2519,13 @@ Deno.serve((req) => {
       case "admin_delete_note": {
         if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
         const dnTarget = (msg.target as string || "").trim().toLowerCase();
-        const dnIndex  = parseInt(msg.index as string) || 0;
+        const dnRawIndex = parseInt(msg.index as string);
         if (!dnTarget) { ws.send(JSON.stringify({ type: "error", message: "Target required." })); break; }
+        if (isNaN(dnRawIndex) || dnRawIndex < 0) { ws.send(JSON.stringify({ type: "error", message: "Valid note index required." })); break; }
+        const dnIndex = dnRawIndex;
         const dnKey   = ["admin_notes", dnTarget];
         const dnNotes = (await kv.get<unknown[]>(dnKey)).value || [];
+        if (dnIndex >= dnNotes.length) { ws.send(JSON.stringify({ type: "error", message: "Note index out of range." })); break; }
         dnNotes.splice(dnIndex, 1);
         await kv.set(dnKey, dnNotes);
         ws.send(JSON.stringify({ type: "admin_notes_data", target: dnTarget, notes: dnNotes }));
