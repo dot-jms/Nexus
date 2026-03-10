@@ -1389,32 +1389,6 @@ Deno.serve((req) => {
         break;
       }
 
-      case "fetch_dm_contacts": {
-        // Return list of users this person has DM history with.
-        // Scans dm_history keys for the sender's name to rebuild the DM sidebar after cache clear.
-        const contactName = senderName.toLowerCase();
-        const dmIter = kv.list<unknown[]>({ prefix: ["dm_history"] });
-        const contacts: { name: string; last: string; lastTs: number; pfp: string | null }[] = [];
-        for await (const item of dmIter) {
-          const key = item.key[1] as string; // e.g. "alice:bob"
-          const parts = key.split(":");
-          if (parts.length !== 2) continue;
-          const other = parts[0] === contactName ? parts[1] : parts[1] === contactName ? parts[0] : null;
-          if (!other) continue;
-          const msgs = item.value || [];
-          const last = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
-          // Get the other user's display name and pfp from accounts
-          const otherAcct = await kv.get<Record<string, unknown>>(["accounts", other]);
-          const displayName = (otherAcct.value?.name as string) || other;
-          const pfp = (otherAcct.value?.pfp as string) || null;
-          contacts.push({ name: displayName, last: (last?.text as string) || "", lastTs: (last?.ts as number) || 0, pfp });
-        }
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "dm_contacts", contacts }));
-        }
-        break;
-      }
-
       case "get_members": {
         const svId = msg.serverId as string;
         const onlineNames = new Set<string>();
@@ -1461,11 +1435,6 @@ Deno.serve((req) => {
         sendToUser(dmTo, msg, true);
         break;
       }
-
-      case "dm_typing":
-        // Route typing indicator to recipient — ephemeral, never queue
-        sendToUser(msg.to as string, { type: "dm_typing", from: senderName }, false);
-        break;
 
       case "dm_request":
       case "dm_accept":
@@ -1765,7 +1734,8 @@ Deno.serve((req) => {
         const updatedSvTo = { ...toEntry.value, ownerId: toNewDisplayName, ownerIdLower: toNewOwner.toLowerCase() };
         await kv.set(["servers", toSvId], updatedSvTo);
         if (publicServers.has(toSvId)) publicServers.set(toSvId, updatedSvTo);
-        broadcast({ type: "server_ownership_transfer", serverId: toSvId, newOwner: toNewDisplayName, by: senderName }, null);
+        // Include full server data so new owner can add to sidebar if not already joined
+        broadcast({ type: "server_ownership_transfer", serverId: toSvId, newOwner: toNewDisplayName, by: senderName, server: updatedSvTo }, null);
         ws.send(JSON.stringify({ type: "success", message: `Ownership of server transferred to ${toNewDisplayName}.` }));
         console.log(`[admin] ${senderName} transferred ownership of ${toSvId} to ${toNewDisplayName}`);
         break;
