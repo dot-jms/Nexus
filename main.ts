@@ -1089,7 +1089,6 @@ Deno.serve((req) => {
           const filtered = delEntry.value.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId);
           await kv.set(delKey, filtered);
         }
-        }
         // Also remove from in-memory cache
         const delMem = msgHistory.get(delChId);
         if (delMem) msgHistory.set(delChId, delMem.filter((m: unknown) => (m as Record<string,unknown>).id !== delMsgId));
