@@ -985,6 +985,35 @@ Deno.serve((req) => {
         break;
       }
 
+      case "channel_update": {
+        // Owner/manage_channels: rename a channel or update its properties (public, allowedRoles, etc.)
+        const cuSvId = (msg.serverId as string || "").trim();
+        const cuChId = (msg.channelId as string || "").trim();
+        const cuChanges = msg.changes as Record<string, unknown>;
+        if (!cuSvId || !cuChId || !cuChanges) break;
+        const cuEntry = await kv.get<Record<string, unknown>>(["servers", cuSvId]);
+        if (!cuEntry.value) break;
+        const cuOwnerLower = (cuEntry.value.ownerIdLower as string || (cuEntry.value.ownerId as string || "").toLowerCase());
+        if (cuOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        // Patch the matching channel inside the channels array
+        const cuChannels = ((cuEntry.value.channels as unknown[]) || []).map((c: unknown) => {
+          const ch = c as Record<string, unknown>;
+          if (ch.id !== cuChId) return ch;
+          // Whitelist safe fields: name, desc, isPublic, allowedRoles
+          const patch: Record<string, unknown> = {};
+          if (typeof cuChanges.name === "string") patch.name = cuChanges.name.slice(0, 64);
+          if (typeof cuChanges.desc === "string") patch.desc = cuChanges.desc.slice(0, 256);
+          if (typeof cuChanges.isPublic === "boolean") patch.isPublic = cuChanges.isPublic;
+          if (Array.isArray(cuChanges.allowedRoles)) patch.allowedRoles = cuChanges.allowedRoles;
+          return { ...ch, ...patch };
+        });
+        const cuUpdated = { ...cuEntry.value, channels: cuChannels };
+        await kv.set(["servers", cuSvId], cuUpdated);
+        if (publicServers.has(cuSvId)) publicServers.set(cuSvId, cuUpdated);
+        broadcastToServer(cuSvId, { type: "server_channel_updated", serverId: cuSvId, channelId: cuChId, changes: cuChanges, by: senderName }, null);
+        break;
+      }
+
       case "channel_remove": {
         // Regular user removes a channel from their own server
         const crSvId = (msg.serverId as string || "").trim();
