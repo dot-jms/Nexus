@@ -1431,9 +1431,12 @@ Deno.serve((req) => {
           const preservedOwner = { ownerId: existing.value.ownerId, ownerIdLower: existing.value.ownerIdLower || (existing.value.ownerId as string || "").toLowerCase() };
           await kv.set(["servers", sid], { ...existing.value, ...safeMsg, ...preservedOwner });
         }
-        // Broadcast the message with the correct, authoritative ownerId
+        // Broadcast the update — strip channels so clients don't overwrite
+        // channel state with potentially stale data (channels are managed via
+        // dedicated channel_add / channel_remove / channel_update messages)
         const finalSv = (await kv.get<Record<string, unknown>>(["servers", sid])).value || publicServers.get(sid);
-        broadcast({ ...msg, ownerId: finalSv?.ownerId }, ws);
+        const { channels: _stripChannels, ...msgWithoutChannels } = msg as Record<string, unknown>;
+        broadcast({ ...msgWithoutChannels, ownerId: finalSv?.ownerId }, ws);
         break;
       }
 
