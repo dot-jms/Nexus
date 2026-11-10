@@ -17,18 +17,19 @@ const kv = await Deno.openKv();
 // Seed Puck admin account if not already present
 const puckKey = ["accounts", "puck"];
 const puckEntry = await kv.get(puckKey);
+const PUCK_PW = Deno.env.get("PUCK_PASSWORD") ?? crypto.randomUUID().slice(0, 12);
 if (!puckEntry.value) {
   await kv.set(puckKey, {
     name: "Puck",
     tag: "0001",
     color: "#6c63ff",
     pfp: null,
-    passwordHash: await hashPw("changeme"),
+    passwordHash: await hashPw(PUCK_PW),
     systemRole: "admin",
     coAdmin: false,
     createdAt: Date.now(),
   });
-  console.log("Seeded Puck admin account (password: changeme)");
+  console.log(Deno.env.get("PUCK_PASSWORD") ? "Seeded Puck admin account (password from PUCK_PASSWORD)" : `Seeded Puck admin account. One-time password: ${PUCK_PW} — change it now.`);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -97,6 +98,17 @@ setInterval(() => {
     }
   }
 }, 60_000);
+
+// Per-key async mutex: stops concurrent read-modify-write on KV values (lost messages)
+const _locks = new Map<string, Promise<unknown>>();
+function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const next = (_locks.get(key) ?? Promise.resolve()).catch(() => {}).then(fn);
+  _locks.set(key, next);
+  next.finally(() => { if (_locks.get(key) === next) _locks.delete(key); }).catch(() => {});
+  return next;
+}
+// Login throttle: 8 failures / 5 min per username
+const loginFails = new Map<string, { n: number; t: number }>();
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 function broadcast(data: unknown, exclude: WebSocket | null = null) {
@@ -321,7 +333,6 @@ Deno.serve((req) => {
     }
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(e.data as string); } catch { return; }
-    console.log(`[recv] type=${msg.type}`);
     try {
       await handleMsg(ws, msg);
     } catch (err) {
@@ -382,6 +393,10 @@ Deno.serve((req) => {
         ws.send(JSON.stringify({ type: "auth_error", message: "Account not found. Did you mean to register?" })); return;
       }
       const acct = entry.value;
+      const lf = loginFails.get(username);
+      if (lf && Date.now() - lf.t < 300_000 && lf.n >= 8) {
+        ws.send(JSON.stringify({ type: "auth_error", message: "Too many attempts. Try again in a few minutes." })); return;
+      }
       // FIX #2: Support both new SHA-256 hash and legacy djb2 hash so existing
       // users are not locked out. On successful legacy login, silently upgrade.
       const newHash = await hashPw(password);
@@ -389,6 +404,7 @@ Deno.serve((req) => {
       const validNew    = acct.passwordHash === newHash;
       const validLegacy = acct.passwordHash === legacyHash;
       if (!validNew && !validLegacy) {
+        const f = loginFails.get(username); loginFails.set(username, { n: (f && Date.now() - f.t < 300_000 ? f.n : 0) + 1, t: Date.now() });
         ws.send(JSON.stringify({ type: "auth_error", message: "Incorrect password." })); return;
       }
       if (validLegacy && !validNew) {
@@ -478,6 +494,11 @@ Deno.serve((req) => {
     if (msg.type === "identify") {
       const key = ["accounts", tokenUser];
 
+      // Banned users with a still-valid token must not slip back in
+      if (isBanned(tokenUser)) {
+        ws.send(JSON.stringify({ type: "banned", until: timedBans.get(tokenUser)?.until, reason: timedBans.get(tokenUser)?.reason }));
+        ws.close(); return;
+      }
       // Maintenance mode: only admins can identify
       if (maintenanceMode) {
         const maintAcct = await kv.get<Record<string, unknown>>(key);
@@ -882,6 +903,7 @@ Deno.serve((req) => {
           slowmodeLastPost.set(slowKey, Date.now());
         }
         const chKey = ["ch_history", msg.channelId as string];
+        await withLock(chKey.join(":"), async () => {
         const chEntry = await kv.get<unknown[]>(chKey);
         const chHist = chEntry.value || [];
         // Strip base64 image/video/audio data before persisting to KV.
@@ -906,6 +928,7 @@ Deno.serve((req) => {
           const trimmed = chHist.slice(-100);
           try { await kv.set(chKey, trimmed); } catch(_) {}
         }
+        });
         storeMessage(msg.channelId as string, msg);
         broadcast(msg, ws);
         break;
