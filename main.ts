@@ -107,6 +107,14 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   next.finally(() => { if (_locks.get(key) === next) _locks.delete(key); }).catch(() => {});
   return next;
 }
+// Peer-to-peer history relay: reqId → who asked, for which server/channel (expires after 60s)
+const historyRequests = new Map<string, { requester: string; serverId: string; channelId: string; exp: number }>();
+const historyRequestLast = new Map<string, number>(); // "user:channel" → last request time (rate limit)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, r] of historyRequests) if (r.exp < now) historyRequests.delete(id);
+  for (const [k, t] of historyRequestLast) if (now - t > 60_000) historyRequestLast.delete(k);
+}, 30_000);
 // Login throttle: 8 failures / 5 min per username
 const loginFails = new Map<string, { n: number; t: number }>();
 
@@ -206,23 +214,130 @@ function isBanned(username: string): boolean {
 
 // ─── FIX: Helper to add a server to a user's membership index ───────────────
 // Always uses lowercase username as the KV key to avoid case mismatches.
+// Read-modify-write on a user's index must be serialized, otherwise two quick joins (or a
+// join racing an identify) overwrite each other and a server silently drops off the list.
 async function addServerToUser(username: string, serverId: string) {
-  const key = ["user_servers", username.toLowerCase()];
-  const entry = await kv.get<string[]>(key);
-  const list = entry.value || [];
-  if (!list.includes(serverId)) {
-    list.push(serverId);
-    await kv.set(key, list);
-    console.log(`[membership] added server ${serverId} to user ${username.toLowerCase()} (now has ${list.length})`);
-  }
+  const lower = username.toLowerCase();
+  const key = ["user_servers", lower];
+  await withLock("user_servers:" + lower, async () => {
+    const entry = await kv.get<string[]>(key);
+    const list = entry.value || [];
+    if (!list.includes(serverId)) {
+      list.push(serverId);
+      await kv.set(key, list);
+      console.log(`[membership] added server ${serverId} to user ${lower} (now has ${list.length})`);
+    }
+  });
 }
 
 async function removeServerFromUser(username: string, serverId: string) {
-  const key = ["user_servers", username.toLowerCase()];
-  const entry = await kv.get<string[]>(key);
-  if (entry.value) {
-    await kv.set(key, entry.value.filter((id: string) => id !== serverId));
+  const lower = username.toLowerCase();
+  const key = ["user_servers", lower];
+  await withLock("user_servers:" + lower, async () => {
+    const entry = await kv.get<string[]>(key);
+    if (entry.value && entry.value.includes(serverId)) {
+      await kv.set(key, entry.value.filter((id: string) => id !== serverId));
+    }
+  });
+}
+
+// ─── KV safety ──────────────────────────────────────────────────────────────
+// Deno KV rejects any single value over 64 KiB. Several handlers used to call kv.set
+// without checking, the throw was swallowed, and the write silently never happened
+// (this is why messages and channels "vanished" after a refresh).
+const KV_MAX_VALUE_BYTES = 60_000; // margin under the 65,536 limit
+const _enc = new TextEncoder();
+function byteLen(v: unknown): number { return _enc.encode(JSON.stringify(v)).length; }
+async function safeKvSet(key: Deno.KvKey, value: unknown): Promise<boolean> {
+  try { await kv.set(key, value); return true; }
+  catch (e) { console.error(`[kv] write failed for ${JSON.stringify(key).slice(0, 80)}:`, e); return false; }
+}
+
+// Strip everything from a chat message that must never be persisted or replayed:
+//  - token: the sender's session token (the client attaches it to every WS frame)
+//  - authorPfp: a base64 avatar up to ~40 KB, which alone blows the 64 KiB limit
+//  - inline data: URLs (large attachments) are served peer-to-peer instead
+function sanitizeMsgForStore(msg: Record<string, unknown>): Record<string, unknown> {
+  const m: Record<string, unknown> = { ...msg };
+  delete m.token;
+  delete m.authorPfp;
+  if (typeof m.text === "string" && m.text.length > 4000) m.text = (m.text as string).slice(0, 4000);
+  if (Array.isArray(m.attachments)) {
+    m.attachments = (m.attachments as Record<string, unknown>[]).map((att) => {
+      const url = (att.url as string) || "";
+      if (url.startsWith("data:") || url.length > 2000) return { ...att, url: "", _stripped: true };
+      return att;
+    });
   }
+  return m;
+}
+// Keep the newest messages that fit inside one KV value.
+function fitHistory(hist: unknown[]): unknown[] {
+  let h = hist.length > 500 ? hist.slice(-500) : hist;
+  while (h.length > 1 && byteLen(h) > KV_MAX_VALUE_BYTES) h = h.slice(Math.max(1, Math.ceil(h.length * 0.1)));
+  return h;
+}
+
+// ─── Deleted-server tombstones ──────────────────────────────────────────────
+// Without these, anything still holding the server (a stale tab, a queued server_create
+// retry, announce_servers, a server_update) simply re-created it after deletion.
+async function isTombstoned(serverId: string): Promise<boolean> {
+  if (!serverId) return false;
+  return !!(await kv.get(["deleted_servers", serverId])).value;
+}
+
+// Delete a server and everything hanging off it, then leave a tombstone.
+async function purgeServer(serverId: string, by: string) {
+  const entry = await kv.get<Record<string, unknown>>(["servers", serverId]);
+  await kv.set(["deleted_servers", serverId], { at: Date.now(), by });
+  publicServers.delete(serverId);
+  await kv.delete(["servers", serverId]);
+  const chans = (entry.value?.channels as Array<{ id: string }>) || [];
+  for (const ch of chans) {
+    await kv.delete(["ch_history", ch.id]);
+    await kv.delete(["pins", serverId, ch.id]);
+    await kv.delete(["channel_lock", ch.id]);
+    await kv.delete(["slowmode", ch.id]);
+    msgHistory.delete(ch.id); channelLocks.delete(ch.id); slowmodes.delete(ch.id);
+  }
+  await kv.delete(["shorts", serverId]);
+  await kv.delete(["custom_emoji_names", serverId]);
+  const memIter = kv.list({ prefix: ["server_member", serverId] });
+  for await (const item of memIter) {
+    await kv.delete(item.key);
+    await removeServerFromUser(item.key[2] as string, serverId);
+  }
+  // Keep every connected client's in-memory membership in sync
+  for (const [, ci] of clients) (ci.serverIds as Set<string> | undefined)?.delete(serverId);
+}
+
+// memberCount is derived from the real member records, not incremented blindly.
+async function recountMembers(serverId: string): Promise<number> {
+  let n = 0;
+  for await (const _ of kv.list({ prefix: ["server_member", serverId] })) n++;
+  const entry = await kv.get<Record<string, unknown>>(["servers", serverId]);
+  if (entry.value && entry.value.memberCount !== n) {
+    const updated = { ...entry.value, memberCount: Math.max(n, 1) };
+    await safeKvSet(["servers", serverId], updated);
+    if (publicServers.has(serverId)) publicServers.set(serverId, updated);
+  }
+  return n;
+}
+
+// Owner / platform admin, or a member whose role grants the permission (mirrors the client's hasPerm)
+function canManageServer(sv: Record<string, unknown>, username: string, perm: string, isPower: boolean): boolean {
+  if (isPower) return true;
+  const lower = username.toLowerCase();
+  const owner = (sv.ownerIdLower as string) || ((sv.ownerId as string) || "").toLowerCase();
+  if (owner === lower) return true;
+  const memberRoles = (sv.memberRoles as Record<string, string>) || {};
+  const roleId = memberRoles[username] ?? Object.entries(memberRoles).find(([k]) => k.toLowerCase() === lower)?.[1];
+  if (!roleId) return false;
+  const overrides = (sv.roleOverrides as Record<string, { perms?: string[] }>) || {};
+  const custom = ((sv.roles as Array<{ id: string; perms?: string[] }>) || []).find((r) => r.id === roleId);
+  const builtinMod = ["manage_messages", "kick_members", "pin_messages", "invite_members"];
+  const perms = overrides[roleId]?.perms ?? custom?.perms ?? (roleId === "mod" ? builtinMod : []);
+  return perms.includes("*") || perms.includes(perm);
 }
 
 // ─── Load persisted servers into memory on startup ──────────────────────────
@@ -239,11 +354,30 @@ async function removeServerFromUser(username: string, serverId: string) {
   for await (const item of allIter) allKeys.push(JSON.stringify(item.key));
   console.log(`[startup] KV keys (${allKeys.length} total): ${allKeys.slice(0, 20).join(", ")}`);
 
+  // Load channel history. Older builds persisted each sender's session token and full avatar
+  // inside every message (token leak + the reason histories hit the 64 KiB cap), so scrub on load.
+  let scrubbed = 0;
   const chIter = kv.list<unknown[]>({ prefix: ["ch_history"] });
   for await (const item of chIter) {
     const chId = item.key[1] as string;
-    if (item.value?.length) msgHistory.set(chId, item.value);
+    if (!item.value?.length) continue;
+    const cleaned = (item.value as Record<string, unknown>[]).map(sanitizeMsgForStore);
+    if (JSON.stringify(cleaned) !== JSON.stringify(item.value)) {
+      const fitted = fitHistory(cleaned);
+      if (await safeKvSet(item.key, fitted)) { scrubbed++; msgHistory.set(chId, fitted); continue; }
+    }
+    msgHistory.set(chId, item.value);
   }
+  if (scrubbed) console.log(`[startup] scrubbed tokens/avatars from ${scrubbed} channel history record(s)`);
+  // same for DM history (it was also storing every sender's session token)
+  let dmScrubbed = 0;
+  const dmHistIter = kv.list<unknown[]>({ prefix: ["dm_history"] });
+  for await (const item of dmHistIter) {
+    if (!item.value?.length) continue;
+    const cleaned = (item.value as Record<string, unknown>[]).map((m) => ({ ...sanitizeMsgForStore(m), ...(m._stored !== undefined ? { _stored: m._stored } : {}) }));
+    if (JSON.stringify(cleaned) !== JSON.stringify(item.value) && await safeKvSet(item.key, fitHistory(cleaned))) dmScrubbed++;
+  }
+  if (dmScrubbed) console.log(`[startup] scrubbed tokens/avatars from ${dmScrubbed} DM history record(s)`);
 
   // FIX #3: Restore persisted bans. Expired ones are cleaned up here so they
   // don't accumulate in KV indefinitely.
@@ -469,6 +603,10 @@ Deno.serve((req) => {
       return;
     }
 
+    // The client attaches its session token to every frame. Everything below this point gets
+    // broadcast and/or persisted as-is, so remove the token now (identify still needs it).
+    if (msg.type !== "identify") delete msg.token;
+
     // ── auth_change_password — allowed before full identify ───────────────
     if (msg.type === "auth_change_password") {
       const oldPassword = msg.oldPassword as string || "";
@@ -580,24 +718,40 @@ Deno.serve((req) => {
           }
         }
         if (recovered.length) {
-          const merged = [...(userSvIdsEntry.value || []), ...recovered];
           console.log(`[migrate] recovered ${recovered.length} orphaned server(s) for ${name}: ${recovered.join(", ")}`);
-          await kv.set(userSvsKey, merged);
+          for (const rid of recovered) await addServerToUser(name, rid);
           userSvIdsEntry = await kv.get<string[]>(userSvsKey);
         }
       }
 
       console.log(`[identify] user=${name} (key=${tokenUser}) user_servers=${JSON.stringify(userSvIdsEntry.value)}`);
-      const userSvIds = userSvIdsEntry.value || [];
+      const userSvIds: string[] = [...(userSvIdsEntry.value || [])];
+
+      // The client tells us which servers it has cached. Anything it lists that the membership index
+      // lost, but that still has a member record for this user, is healed back into the index.
+      const clientKnownIds: string[] = Array.isArray(msg.knownServerIds)
+        ? (msg.knownServerIds as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 200)
+        : [];
+      for (const kid of clientKnownIds) {
+        if (userSvIds.includes(kid)) continue;
+        const [m1, m2] = await Promise.all([kv.get(["server_member", kid, name]), kv.get(["server_member", kid, tokenUser])]);
+        if ((m1.value || m2.value) && (await kv.get(["servers", kid])).value) {
+          userSvIds.push(kid);
+          await addServerToUser(name, kid);
+          console.log(`[identify] healed missing index entry ${kid} for ${name}`);
+        }
+      }
 
       // Store server membership on client info for scoped broadcasting
       const clientInfo2 = clients.get(ws);
       if (clientInfo2) (clientInfo2 as Record<string, unknown>).serverIds = new Set(userSvIds);
 
       const userServers: Record<string, unknown>[] = [];
+      const danglingIds: string[] = [];
       for (const svId of userSvIds) {
         const svEntry = await kv.get<Record<string, unknown>>(["servers", svId]);
         console.log(`[identify] svId=${svId} found=${!!svEntry.value}`);
+        if (!svEntry.value) danglingIds.push(svId);
         if (svEntry.value) {
           const sv = svEntry.value;
           // Load pins for all channels in this server
@@ -627,6 +781,25 @@ Deno.serve((req) => {
       }
       console.log(`[identify] sending ${userServers.length} servers to ${name}`);
 
+      // Self-heal: ids pointing at servers that no longer exist (deleted, or deleted before the index
+      // was cleaned) used to sit in the index forever.
+      for (const did of danglingIds) await removeServerFromUser(name, did);
+      { const ci3 = clients.get(ws); if (ci3) ci3.serverIds = new Set(userServers.map((s) => s.id as string)); }
+
+      // Reconcile what the client has cached against the truth, so it can drop ghosts:
+      //  removedServerIds — deleted, or the account isn't a member (join never took / was kicked)
+      //  missingServerIds — gone from the database but not deleted on purpose (e.g. data loss); the
+      //                     client's owner can re-register these, everyone else should drop them
+      const listedIds = new Set(userServers.map((s) => s.id as string));
+      const removedServerIds: string[] = [];
+      const missingServerIds: string[] = [];
+      for (const kid of clientKnownIds) {
+        if (listedIds.has(kid)) continue;
+        if (await isTombstoned(kid)) removedServerIds.push(kid);
+        else if ((await kv.get(["servers", kid])).value) removedServerIds.push(kid);
+        else missingServerIds.push(kid);
+      }
+
       const friendsRaw = ((await kv.get<unknown[]>(["friends", tokenUser])).value || []) as Record<string, unknown>[];
       // Enrich friends with current pfp from their account records
       const friendsList = await Promise.all(friendsRaw.map(async f => {
@@ -652,6 +825,8 @@ Deno.serve((req) => {
             socials: acct?.socials || {}
           },
           servers: userServers,
+          removedServerIds,
+          missingServerIds,
         }));
         // Always send pfp state: send null explicitly if the user has none,
         // so the client can clear a stale cached pfp after an admin wipe.
@@ -824,19 +999,7 @@ Deno.serve((req) => {
     if (msg.type === "admin_delete_server") {
       if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); return; }
       const adminDelId = msg.serverId as string;
-      const adminDelEntry = await kv.get<Record<string, unknown>>(["servers", adminDelId]);
-      publicServers.delete(adminDelId);
-      await kv.delete(["servers", adminDelId]);
-      // Clean up channel history
-      const adminDelChannels = (adminDelEntry.value?.channels as Array<{ id: string }>) || [];
-      for (const ch of adminDelChannels) await kv.delete(["ch_history", ch.id]);
-      // Clean up member indexes
-      const adminDelMemIter = kv.list({ prefix: ["server_member", adminDelId] });
-      for await (const item of adminDelMemIter) {
-        const memberName = item.key[2] as string;
-        await kv.delete(item.key);
-        await removeServerFromUser(memberName, adminDelId);
-      }
+      await purgeServer(adminDelId, senderName);
       broadcast({ type: "server_delete", serverId: adminDelId, by: senderName });
       ws.send(JSON.stringify({ type: "success", message: "Server deleted." }));
       return;
@@ -903,33 +1066,22 @@ Deno.serve((req) => {
           slowmodeLastPost.set(slowKey, Date.now());
         }
         const chKey = ["ch_history", msg.channelId as string];
+        // Strip the token / avatar / inline base64 before persisting (see sanitizeMsgForStore).
+        // Live recipients still get the full message via broadcast; late joiners fetch large
+        // attachments peer-to-peer with video_request.
+        const msgToStore = sanitizeMsgForStore(msg as Record<string, unknown>);
         await withLock(chKey.join(":"), async () => {
-        const chEntry = await kv.get<unknown[]>(chKey);
-        const chHist = chEntry.value || [];
-        // Strip base64 image/video/audio data before persisting to KV.
-        // Deno free tier has a 64 KB per-value limit — base64 attachments can be several MB.
-        // Live recipients get the full data via broadcast below; late-joiners use p2p video_request.
-        const msgToStore = { ...(msg as Record<string,unknown>) };
-        if (Array.isArray(msgToStore.attachments)) {
-          msgToStore.attachments = (msgToStore.attachments as Record<string,unknown>[]).map(att => {
-            const url = att.url as string || "";
-            if (url.startsWith("data:")) {
-              return { ...att, url: "", _stripped: true };
-            }
-            return att;
-          });
-        }
-        chHist.push(msgToStore);
-        if (chHist.length > 500) chHist.splice(0, chHist.length - 500);
-        try {
-          await kv.set(chKey, chHist);
-        } catch(e) {
-          // If history is still too large, trim aggressively and retry
-          const trimmed = chHist.slice(-100);
-          try { await kv.set(chKey, trimmed); } catch(_) {}
-        }
+          const chEntry = await kv.get<unknown[]>(chKey);
+          const chHist = (chEntry.value || []) as unknown[];
+          chHist.push(msgToStore);
+          // fitHistory drops the oldest messages until the value fits under the KV limit, so the
+          // write can no longer fail and take the newest message down with it.
+          const fitted = fitHistory(chHist);
+          if (!(await safeKvSet(chKey, fitted))) {
+            ws.send(JSON.stringify({ type: "error", message: "Couldn't save your last message to history." }));
+          }
         });
-        storeMessage(msg.channelId as string, msg);
+        storeMessage(msg.channelId as string, msgToStore);
         broadcast(msg, ws);
         break;
       }
@@ -946,6 +1098,72 @@ Deno.serve((req) => {
         break;
       }
 
+      // ── Peer-to-peer history ───────────────────────────────────────────────
+      // A new member (or anyone with gaps) asks the other online members of the server for the
+      // messages they have cached. The server only relays: it picks a few online members, forwards
+      // the request, and forwards their answer back. It never trusts the client-supplied identity.
+      case "history_request": {
+        const hrSvId = (msg.serverId as string || "").trim();
+        const hrChId = (msg.channelId as string || "").trim();
+        if (!hrSvId || !hrChId) break;
+        const myIds = (info.serverIds as Set<string> | undefined);
+        if (!myIds?.has(hrSvId) && !isPowerUser) break; // only members can ask
+        const hrSv = (await kv.get<Record<string, unknown>>(["servers", hrSvId])).value;
+        if (!hrSv || !((hrSv.channels as Array<{ id: string }>) || []).some((c) => c.id === hrChId)) break;
+        const rlKey = `${senderName.toLowerCase()}:${hrChId}`;
+        if (Date.now() - (historyRequestLast.get(rlKey) || 0) < 8_000) break;
+        historyRequestLast.set(rlKey, Date.now());
+
+        // every other online member of this server (any channel, any tab), one socket per person
+        const peers = new Map<string, WebSocket>();
+        for (const [pws, ci] of clients) {
+          const pn = ((ci.name as string) || "").toLowerCase();
+          if (!pn || pn === senderName.toLowerCase() || pws.readyState !== WebSocket.OPEN) continue;
+          if ((ci.serverIds as Set<string> | undefined)?.has(hrSvId) && !peers.has(pn)) peers.set(pn, pws);
+        }
+        const chosen = [...peers.values()].sort(() => Math.random() - 0.5).slice(0, 3);
+        if (!chosen.length) { ws.send(JSON.stringify({ type: "history_peers", channelId: hrChId, peers: 0 })); break; }
+        const reqId = crypto.randomUUID();
+        historyRequests.set(reqId, { requester: senderName.toLowerCase(), serverId: hrSvId, channelId: hrChId, exp: Date.now() + 60_000 });
+        const fwd = JSON.stringify({
+          type: "history_request", reqId, serverId: hrSvId, channelId: hrChId,
+          since: Number(msg.since) || 0, before: Number(msg.before) || 0,
+        });
+        for (const pws of chosen) pws.send(fwd);
+        break;
+      }
+
+      case "history_serve": {
+        const req = historyRequests.get(msg.reqId as string);
+        if (!req || req.exp < Date.now()) break;
+        if (!(info.serverIds as Set<string> | undefined)?.has(req.serverId) && !isPowerUser) break;
+        const raw = Array.isArray(msg.messages) ? (msg.messages as Record<string, unknown>[]).slice(0, 150) : [];
+        if (!raw.length) break;
+
+        // Server history is authoritative. Peers only fill in what the server doesn't have: messages
+        // older than its retained window, or everything if it has none. That also means a message
+        // deleted from server history can't be resurrected by a stale peer cache.
+        const kvHist = ((await kv.get<unknown[]>(["ch_history", req.channelId])).value || []) as Record<string, unknown>[];
+        const oldestKv = kvHist.length ? Math.min(...kvHist.map((m) => Number(m.ts) || Infinity)) : Infinity;
+        const out: Record<string, unknown>[] = [];
+        for (const m of raw) {
+          if (!m || typeof m.id !== "string" || typeof m.author !== "string" || typeof m.ts !== "number") continue;
+          if (!(Number(m.ts) < oldestKv)) continue;
+          const s = sanitizeMsgForStore(m);
+          // whitelist: a peer can't smuggle arbitrary fields to the requester
+          out.push({
+            id: s.id, channelId: req.channelId, serverId: req.serverId, author: s.author,
+            authorTag: s.authorTag, authorColor: s.authorColor, text: typeof s.text === "string" ? s.text : "",
+            attachments: Array.isArray(s.attachments) ? s.attachments : [], ts: s.ts,
+            reactions: Array.isArray(s.reactions) ? s.reactions : [], edited: s.edited === true ? true : undefined,
+            voiceMsg: s.voiceMsg, replyTo: s.replyTo,
+          });
+        }
+        if (!out.length) break;
+        sendToUser(req.requester, { type: "history", channelId: req.channelId, messages: out, via: "peer", from: senderName }, false);
+        break;
+      }
+
       case "ping":
         // Keepalive — reply immediately so client knows connection is alive
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
@@ -954,10 +1172,36 @@ Deno.serve((req) => {
       case "typing":
       case "member_join":
       case "member_leave":
-      case "kick_member":
       case "status_update":
         broadcast(msg, ws);
         break;
+
+      case "kick_member": {
+        // Used to be a bare broadcast: anyone could "kick" anyone, and the kick was never saved,
+        // so the member came straight back on their next refresh.
+        const kmSvId = (msg.serverId as string || "").trim();
+        const kmTarget = (msg.target as string || "").trim();
+        if (!kmSvId || !kmTarget) break;
+        const kmSv = (await kv.get<Record<string, unknown>>(["servers", kmSvId])).value;
+        if (!kmSv) break;
+        if (!canManageServer(kmSv, senderName, "kick_members", isPowerUser)) {
+          ws.send(JSON.stringify({ type: "error", message: "You don't have permission to kick members." }));
+          break;
+        }
+        const kmOwner = ((kmSv.ownerIdLower as string) || ((kmSv.ownerId as string) || "").toLowerCase());
+        if (kmTarget.toLowerCase() === kmOwner) {
+          ws.send(JSON.stringify({ type: "error", message: "The server owner can't be kicked." }));
+          break;
+        }
+        await kv.delete(["server_member", kmSvId, kmTarget]);
+        await removeServerFromUser(kmTarget, kmSvId);
+        for (const [, ci] of clients) {
+          if ((ci.name as string)?.toLowerCase() === kmTarget.toLowerCase()) (ci.serverIds as Set<string> | undefined)?.delete(kmSvId);
+        }
+        await recountMembers(kmSvId);
+        broadcast({ type: "kick_member", serverId: kmSvId, target: kmTarget, by: senderName }, null);
+        break;
+      }
 
       case "pin_message": {
         // Persist to KV so pins survive cache clears
@@ -997,12 +1241,22 @@ Deno.serve((req) => {
         if (!caSvId || !caCh?.id || !caCh?.name) break;
         const caEntry = await kv.get<Record<string, unknown>>(["servers", caSvId]);
         if (!caEntry.value) break;
-        // Permission check: sender must be owner or admin
-        const caOwnerLower = (caEntry.value.ownerIdLower as string || (caEntry.value.ownerId as string || "").toLowerCase());
-        if (caOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        // Owner, platform admin, or a member whose role has manage_channels. Before this only the owner
+        // passed, but the client lets role-holders create channels, so theirs existed only locally and
+        // vanished on refresh. A refusal now tells the client and resyncs it to the real channel list.
+        if (!canManageServer(caEntry.value, senderName, "manage_channels", isPowerUser)) {
+          ws.send(JSON.stringify({ type: "error", message: "You don't have permission to create channels here." }));
+          ws.send(JSON.stringify({ type: "server_info", server: caEntry.value }));
+          break;
+        }
+        if (((caEntry.value.channels as Array<{ id: string }>) || []).some((c) => c.id === caCh.id)) break; // already there
         const caChannels = [...((caEntry.value.channels as unknown[]) || []), caCh];
         const caUpdated  = { ...caEntry.value, channels: caChannels };
-        await kv.set(["servers", caSvId], caUpdated);
+        if (!(await safeKvSet(["servers", caSvId], caUpdated))) {
+          ws.send(JSON.stringify({ type: "error", message: "Couldn't save the new channel." }));
+          ws.send(JSON.stringify({ type: "server_info", server: caEntry.value }));
+          break;
+        }
         if (publicServers.has(caSvId)) publicServers.set(caSvId, caUpdated);
         broadcastToServer(caSvId, { type: "server_channel_added", serverId: caSvId, channel: caCh, by: senderName }, null);
         break;
@@ -1016,8 +1270,11 @@ Deno.serve((req) => {
         if (!cuSvId || !cuChId || !cuChanges) break;
         const cuEntry = await kv.get<Record<string, unknown>>(["servers", cuSvId]);
         if (!cuEntry.value) break;
-        const cuOwnerLower = (cuEntry.value.ownerIdLower as string || (cuEntry.value.ownerId as string || "").toLowerCase());
-        if (cuOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        if (!canManageServer(cuEntry.value, senderName, "manage_channels", isPowerUser)) {
+          ws.send(JSON.stringify({ type: "error", message: "You don't have permission to edit channels here." }));
+          ws.send(JSON.stringify({ type: "server_info", server: cuEntry.value }));
+          break;
+        }
         // Patch the matching channel inside the channels array
         const cuChannels = ((cuEntry.value.channels as unknown[]) || []).map((c: unknown) => {
           const ch = c as Record<string, unknown>;
@@ -1044,8 +1301,11 @@ Deno.serve((req) => {
         if (!crSvId || !crChId) break;
         const crEntry = await kv.get<Record<string, unknown>>(["servers", crSvId]);
         if (!crEntry.value) break;
-        const crOwnerLower = (crEntry.value.ownerIdLower as string || (crEntry.value.ownerId as string || "").toLowerCase());
-        if (crOwnerLower !== senderName.toLowerCase() && !isAdmin && !isCoAdmin) break;
+        if (!canManageServer(crEntry.value, senderName, "manage_channels", isPowerUser)) {
+          ws.send(JSON.stringify({ type: "error", message: "You don't have permission to delete channels here." }));
+          ws.send(JSON.stringify({ type: "server_info", server: crEntry.value }));
+          break;
+        }
         const crChannels = ((crEntry.value.channels as unknown[]) || []).filter((c: unknown) => (c as Record<string,unknown>).id !== crChId);
         const crUpdated  = { ...crEntry.value, channels: crChannels };
         await kv.set(["servers", crSvId], crUpdated);
@@ -1374,6 +1634,30 @@ Deno.serve((req) => {
 
       case "server_create": {
         console.log(`[server_create] RECEIVED from ${senderName} id=${msg.serverId} name=${msg.name}`);
+        {
+          const scId = msg.serverId as string;
+          if (!scId || typeof scId !== "string") break;
+          // A deleted server must stay deleted — retries / stale tabs land here.
+          if (await isTombstoned(scId)) {
+            ws.send(JSON.stringify({ type: "server_gone", serverId: scId }));
+            break;
+          }
+          // Re-sending a create for a server that already exists (lost ACK, retry, KV recovery) must not
+          // clobber it, and nobody may hijack somebody else's server by reusing its id.
+          const scExisting = (await kv.get<Record<string, unknown>>(["servers", scId])).value;
+          if (scExisting) {
+            const exOwner = ((scExisting.ownerIdLower as string) || ((scExisting.ownerId as string) || "").toLowerCase());
+            if (exOwner !== senderName.toLowerCase() && !isPowerUser) {
+              ws.send(JSON.stringify({ type: "error", message: "That server id is already taken." }));
+              break;
+            }
+            await kv.set(["server_member", scId, senderName], { joinedAt: Date.now() });
+            await addServerToUser(senderName, scId);
+            const ci0 = clients.get(ws); if (ci0) (ci0.serverIds as Set<string>)?.add(scId);
+            ws.send(JSON.stringify({ type: "server_create_ok", serverId: scId }));
+            break;
+          }
+        }
         // FIX: store ownerId as the canonical display name from the account record,
         // but guarantee it's always findable via case-insensitive lookup.
         // senderName comes from acct.name (display name), which is fine for display.
@@ -1386,8 +1670,11 @@ Deno.serve((req) => {
           ownerIdLower: senderName.toLowerCase(), // FIX: add lowercased copy for reliable matching
           isPublic: msg.isPublic !== false,
         };
+        if (!(await safeKvSet(["servers", msg.serverId as string], svData))) {
+          ws.send(JSON.stringify({ type: "error", message: "Couldn't save the server (too large?). Try again without a custom icon." }));
+          break;
+        }
         if (svData.isPublic) publicServers.set(msg.serverId as string, svData);
-        await kv.set(["servers", msg.serverId as string], svData);
 
         // Verify it actually wrote
         const verifyWrite = await kv.get(["servers", msg.serverId as string]);
@@ -1395,6 +1682,7 @@ Deno.serve((req) => {
 
         await kv.set(["server_member", msg.serverId as string, senderName], { joinedAt: Date.now() });
         await addServerToUser(senderName, msg.serverId as string);
+        { const ci1 = clients.get(ws); if (ci1) (ci1.serverIds as Set<string>)?.add(msg.serverId as string); }
 
         // Verify user_servers index
         const verifyIndex = await kv.get(["user_servers", senderName.toLowerCase()]);
@@ -1417,7 +1705,10 @@ Deno.serve((req) => {
 
       case "server_update": {
         const sid = msg.serverId as string;
+        if (await isTombstoned(sid)) { ws.send(JSON.stringify({ type: "server_gone", serverId: sid })); break; }
         const existing = await kv.get<Record<string, unknown>>(["servers", sid]);
+        // server_update edits a server, it never creates one (server_create does that).
+        if (!existing.value && !publicServers.has(sid)) break;
         // FIX: Guard - only owner or admin can update a server
         const svForCheck = existing.value || publicServers.get(sid);
         if (svForCheck) {
@@ -1432,6 +1723,10 @@ Deno.serve((req) => {
         const safeMsg = { ...msg as Record<string, unknown> };
         delete safeMsg.ownerId;
         delete safeMsg.ownerIdLower;
+        if (typeof safeMsg.icon === "string" && byteLen(safeMsg.icon) > 45_000) {
+          delete safeMsg.icon;
+          ws.send(JSON.stringify({ type: "error", message: "That server icon is too large to save. Pick a smaller image." }));
+        }
         if (publicServers.has(sid)) {
           const sv = publicServers.get(sid)!;
           // Preserve ownerId/ownerIdLower from stored record
@@ -1476,18 +1771,11 @@ Deno.serve((req) => {
           ws.send(JSON.stringify({ type: "error", message: "Only the server owner can delete this server." }));
           break;
         }
-        publicServers.delete(delSvId);
-        await kv.delete(["servers", delSvId]);
-        const delChannels = (delSvEntry.value?.channels as Array<{ id: string }>) || [];
-        for (const ch of delChannels) await kv.delete(["ch_history", ch.id]);
-        // Remove from all member indexes
-        const delMemIter = kv.list({ prefix: ["server_member", delSvId] });
-        for await (const item of delMemIter) {
-          const memberName = item.key[2] as string;
-          await kv.delete(item.key);
-          await removeServerFromUser(memberName, delSvId);
-        }
-        broadcast(msg, ws);
+        // purgeServer removes the server, channel history, pins, member + index entries AND leaves a
+        // tombstone so a stale client can't bring it back from the dead.
+        await purgeServer(delSvId, senderName);
+        // Echo to the sender too: their other tabs/devices must drop it as well.
+        broadcast(msg, null);
         break;
       }
 
@@ -1505,33 +1793,46 @@ Deno.serve((req) => {
         }
         await kv.delete(["server_member", msg.serverId as string, senderName]);
         await removeServerFromUser(senderName, msg.serverId as string);
+        // every socket this user has open (other tabs) leaves too
+        for (const [, ci] of clients) {
+          if ((ci.name as string)?.toLowerCase() === senderName.toLowerCase()) (ci.serverIds as Set<string> | undefined)?.delete(msg.serverId as string);
+        }
+        await recountMembers(msg.serverId as string);
         broadcast(msg, ws);
         break;
       }
 
       case "join_server": {
         const jsvId = msg.serverId as string;
-        // Look up the server — fall back to KV if not in the public cache (e.g. private servers)
+        // Tell the client precisely why a join failed, so it can undo its optimistic "Joined" state
+        // instead of showing a server the account isn't actually in.
+        const joinFail = (message: string) => ws.send(JSON.stringify({ type: "error", context: "join_server", serverId: jsvId, message }));
+        if (await isTombstoned(jsvId)) { ws.send(JSON.stringify({ type: "server_gone", serverId: jsvId })); break; }
         const jsvEntry = await kv.get<Record<string,unknown>>(["servers", jsvId]);
         const jsv = jsvEntry.value;
-        if (!jsv) { ws.send(JSON.stringify({ type: "error", message: "Server not found." })); break; }
+        if (!jsv) { joinFail("Server not found."); break; }
         // Non-power-users may only join public servers
-        if (jsv.isPublic === false && !isPowerUser) {
-          ws.send(JSON.stringify({ type: "error", message: "That server is private." }));
-          break;
-        }
-        const sv = publicServers.get(jsvId);
-        if (sv) { sv.memberCount = ((sv.memberCount as number) || 1) + 1; await kv.set(["servers", jsvId], sv); }
-        await kv.set(["server_member", jsvId, senderName], { joinedAt: Date.now() });
-        // FIX: Use helper to ensure consistent lowercase key
+        if (jsv.isPublic === false && !isPowerUser) { joinFail("That server is private."); break; }
+
+        // Membership is written FIRST. Previously the (unguarded) server rewrite came before it, so any
+        // failure there meant the join was never recorded and the account later "wasn't in any servers".
+        const jsvMemKey = ["server_member", jsvId, senderName];
+        const alreadyMember = !!(await kv.get(jsvMemKey)).value;
+        if (!alreadyMember) await kv.set(jsvMemKey, { joinedAt: Date.now() });
         await addServerToUser(senderName, jsvId);
-        // Track in client's in-memory serverIds so broadcastToServer works immediately
-        const joiningInfo = clients.get(ws);
-        if (joiningInfo) {
-          if (!(joiningInfo as Record<string,unknown>).serverIds) (joiningInfo as Record<string,unknown>).serverIds = new Set();
-          ((joiningInfo as Record<string,unknown>).serverIds as Set<string>).add(jsvId);
+        // Track in every open socket of this user so scoped broadcasts + p2p history work immediately
+        for (const [, ci] of clients) {
+          if ((ci.name as string)?.toLowerCase() === senderName.toLowerCase()) {
+            if (!ci.serverIds) ci.serverIds = new Set<string>();
+            (ci.serverIds as Set<string>).add(jsvId);
+          }
         }
-        broadcast(msg, ws);
+        if (!alreadyMember) await recountMembers(jsvId);
+        const jsvFresh = (await kv.get<Record<string,unknown>>(["servers", jsvId])).value || jsv;
+        // Confirm to the joiner with the authoritative server record (channels, roles, count)
+        ws.send(JSON.stringify({ type: "join_ok", serverId: jsvId }));
+        ws.send(JSON.stringify({ type: "server_info", server: jsvFresh }));
+        if (!alreadyMember) broadcast(msg, ws);
         break;
       }
 
@@ -1540,6 +1841,7 @@ Deno.serve((req) => {
         for (const sv of (msg.servers as unknown[] || [])) {
           const s = sv as Record<string, unknown>;
           if (!s.id) continue;
+          if (await isTombstoned(s.id as string)) continue;
           // FIX: Check if server already exists - if so, preserve ownerId
           const existingSv = await kv.get<Record<string, unknown>>(["servers", s.id as string]);
           const existingOwner = existingSv.value?.ownerId;
@@ -1695,10 +1997,12 @@ Deno.serve((req) => {
         // an admin rename) always resolve to the same KV key.
         const dmKey = ["dm_history", [dmFrom.toLowerCase(), dmTo.toLowerCase()].sort().join(":")];
         const existing = await kv.get<unknown[]>(dmKey);
-        const hist = existing.value || [];
-        hist.push({ ...msg, _stored: Date.now() });
-        if (hist.length > 500) hist.splice(0, hist.length - 500);
-        await kv.set(dmKey, hist);
+        const hist = (existing.value || []) as unknown[];
+        hist.push({ ...sanitizeMsgForStore(msg as Record<string, unknown>), _stored: Date.now() });
+        // same 64 KiB rule as channels: trim to fit rather than throw and lose the new message
+        if (!(await safeKvSet(dmKey, fitHistory(hist)))) {
+          ws.send(JSON.stringify({ type: "error", message: "Couldn't save that DM to history." }));
+        }
         sendToUser(dmTo, msg, true);
         break;
       }
@@ -2876,7 +3180,7 @@ Deno.serve((req) => {
         if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
         const auditLimit = Math.min(200, parseInt(msg.limit as string) || 50);
         const auditEntries: unknown[] = [];
-        const auditIter = kv.list({ prefix: ["audit"], reverse: true, limit: auditLimit });
+        const auditIter = kv.list({ prefix: ["audit"] }, { reverse: true, limit: auditLimit });
         for await (const item of auditIter) auditEntries.push(item.value);
         ws.send(JSON.stringify({ type: "admin_audit_log", entries: auditEntries }));
         break;
