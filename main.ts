@@ -12,7 +12,7 @@ const DEPLOY_VERSION = "v1";
 console.log(`[nexus] deploy version: ${DEPLOY_VERSION}`);
 // Bumped whenever the client and server must change together. The client compares this on every connect and
 // warns if the server it talks to is older than it needs (a stale deploy looks fine until you refresh).
-const PROTOCOL = 4;
+const PROTOCOL = 5;
 console.log(`[nexus] server protocol v${PROTOCOL}`);
 
 // ─── KV setup ───────────────────────────────────────────────────────────────
@@ -207,6 +207,138 @@ async function verifyTokenKv(token: string | undefined): Promise<string | null> 
     }
   }
   return null;
+}
+
+// ─── Presence ───────────────────────────────────────────────────────────────
+// Online-ness belongs to a USER, not to a connection. A user can have several sockets (two tabs, or the new
+// page that connects a moment BEFORE the old one's close is processed on a refresh), so "went offline" must
+// only be announced when their LAST socket closes. Status (online / idle / dnd / invisible) is remembered.
+const VALID_STATUS = new Set(["online", "idle", "dnd", "invisible"]);
+const userStatus = new Map<string, string>(); // lowercase name -> status
+function socketsOf(nameLower: string): Array<[WebSocket, Record<string, unknown>]> {
+  const out: Array<[WebSocket, Record<string, unknown>]> = [];
+  for (const [w, ci] of clients) {
+    if (w.readyState === WebSocket.OPEN && ((ci.name as string) || "").toLowerCase() === nameLower) out.push([w, ci]);
+  }
+  return out;
+}
+// How `viewerLower` should see this user. An invisible user looks offline to everyone but themselves.
+function presenceOf(nameLower: string, viewerLower?: string): { online: boolean; status: string } {
+  if (!socketsOf(nameLower).length) return { online: false, status: "offline" };
+  const status = userStatus.get(nameLower) || "online";
+  if (status === "invisible" && nameLower !== viewerLower) return { online: false, status: "offline" };
+  return { online: true, status };
+}
+// last-seen is its own key so writing it can never clobber an account record being edited at the same time
+async function getLastSeen(nameLower: string): Promise<number | null> {
+  return ((await kv.get<number>(["last_seen", nameLower])).value as number | null) || null;
+}
+// Tell everyone who should care (people sharing a server with them, and their friends) about a change.
+async function announcePresence(nameLower: string, displayName: string, fallbackServers?: Set<string>) {
+  const mine = new Set<string>(fallbackServers || []);
+  for (const [, ci] of socketsOf(nameLower)) for (const id of ((ci.serverIds as Set<string>) || [])) mine.add(id);
+  const friendNames = new Set<string>(
+    (((await kv.get<Array<Record<string, unknown>>>(["friends", nameLower])).value) || []).map((f) => String(f.name || "").toLowerCase()),
+  );
+  const p = presenceOf(nameLower);
+  const lastSeen = p.online ? null : await getLastSeen(nameLower);
+  const payload = JSON.stringify({ type: "presence", user: displayName, online: p.online, status: p.status, lastSeen });
+  for (const [w, ci] of clients) {
+    if (w.readyState !== WebSocket.OPEN) continue;
+    const n = ((ci.name as string) || "").toLowerCase();
+    if (!n || n === nameLower) continue;
+    const shares = [...((ci.serverIds as Set<string>) || [])].some((id) => mine.has(id));
+    if (shares || friendNames.has(n)) { try { w.send(payload); } catch { /* socket closing */ } }
+  }
+}
+// Sockets that have been silent for too long are dead (laptop slept, wifi dropped...): close them so the
+// person stops showing as online. The client sends a ping every 20s.
+const envNum = (k: string, d: number) => { try { return Number(Deno.env.get(k)) || d; } catch { return d; } };
+const IDLE_MS = envNum("NEXUS_IDLE_MS", 150_000);   // (overridable so the sweep can be tested in seconds)
+setInterval(() => {
+  const now = Date.now();
+  for (const [w, ci] of clients) {
+    if (w.readyState !== WebSocket.OPEN || !ci.name) continue;
+    if (now - (Number(ci.lastActive) || now) > IDLE_MS) {
+      console.log(`[sweep] closing silent connection for ${ci.name}`);
+      try { w.close(4000, "idle"); } catch { /* already closing */ }
+    }
+  }
+}, envNum("NEXUS_SWEEP_MS", 30_000));
+
+// Friendship helpers --------------------------------------------------------
+type Rec2 = Record<string, unknown>;
+async function friendCard(acct: Rec2, viewerLower: string): Promise<Rec2> {
+  const l = String(acct.name).toLowerCase();
+  const p = presenceOf(l, viewerLower);
+  return { name: acct.name, pfp: safePfp(acct.pfp), color: acct.color || null, online: p.online, status: p.status, lastSeen: p.online ? null : await getLastSeen(l) };
+}
+// Both people become friends. Used when a request is accepted (or when two requests cross).
+async function makeFriends(accepter: string, requester: string): Promise<boolean> {
+  const [aAcct, bAcct] = await Promise.all([kv.get<Rec2>(["accounts", accepter]), kv.get<Rec2>(["accounts", requester])]);
+  if (!aAcct.value || !bAcct.value) return false;
+  for (const [owner, other] of [[accepter, bAcct.value], [requester, aAcct.value]] as Array<[string, Rec2]>) {
+    await withLock("friends:" + owner, async () => {
+      const key = ["friends", owner];
+      const list = (((await kv.get<Rec2[]>(key)).value) || []) as Rec2[];
+      if (!list.some((f) => String(f.name).toLowerCase() === String(other.name).toLowerCase())) {
+        list.push({ name: other.name, pfp: null, color: other.color || null });
+        await kv.set(key, list);
+      }
+    });
+  }
+  for (const [x, y] of [[accepter, requester], [requester, accepter]]) {
+    await kv.delete(["friend_requests", x, y]);
+    await kv.delete(["friend_requests_out", x, y]);
+  }
+  sendToUser(aAcct.value.name as string, { type: "friend_added", by: aAcct.value.name, friend: await friendCard(bAcct.value, accepter) }, true);
+  sendToUser(bAcct.value.name as string, { type: "friend_added", by: aAcct.value.name, friend: await friendCard(aAcct.value, requester) }, true);
+  return true;
+}
+
+// Who is in a server, who is online. One membership listing + parallel account reads; everything one person
+// can be (online/offline/invisible) is decided here, once, so every client renders the same list.
+async function buildMemberList(svId: string, viewerLower: string): Promise<Rec2[]> {
+  const names = new Map<string, string>(); // lower -> stored key
+  for await (const item of kv.list({ prefix: ["server_member", svId] })) {
+    const raw = String(item.key[2]);
+    if (!names.has(raw.toLowerCase())) names.set(raw.toLowerCase(), raw);
+  }
+  const lowers = [...names.keys()];
+  const accts = await Promise.all(lowers.map((l) => kv.get<Rec2>(["accounts", l])));
+  const seen = await Promise.all(lowers.map((l) => (presenceOf(l, viewerLower).online || l === viewerLower) ? Promise.resolve(null) : getLastSeen(l)));
+  const out: Rec2[] = [];
+  lowers.forEach((l, i) => {
+    const a = accts[i].value; if (!a) return;
+    const p = l === viewerLower ? { online: true, status: userStatus.get(l) || "online" } : presenceOf(l, viewerLower);
+    out.push({ ...profileOf(a), online: p.online, status: p.online ? p.status : undefined, lastSeen: p.online ? null : seen[i] });
+  });
+  return out;
+}
+// Older servers had members who chatted but were never recorded as members (join never saved). Find them in
+// recent history and record them. This reads every channel's history, so it runs rarely and AFTER replying.
+const lastGhostSweep = new Map<string, number>();
+async function ghostSweep(svId: string): Promise<number> {
+  if (Date.now() - (lastGhostSweep.get(svId) || 0) < 10 * 60_000) return 0;
+  lastGhostSweep.set(svId, Date.now());
+  const known = new Set<string>();
+  for await (const item of kv.list({ prefix: ["server_member", svId] })) known.add(String(item.key[2]).toLowerCase());
+  const sv = (await kv.get<Rec2>(["servers", svId])).value;
+  let added = 0;
+  for (const ch of ((sv?.channels as Array<{ id: string }>) || [])) {
+    for (const m of (((await kv.get<unknown[]>(["ch_history", ch.id])).value) || []) as Rec2[]) {
+      const lower = String(m.author || "").toLowerCase();
+      if (!lower || known.has(lower)) continue;
+      known.add(lower);
+      const acct = (await kv.get<Rec2>(["accounts", lower])).value;
+      if (!acct) continue;
+      await kv.set(["server_member", svId, acct.name as string], { joinedAt: Date.now(), addedBy: "ghost-sweep" });
+      await addServerToUser(lower, svId);
+      added++;
+      console.log(`[ghost-sweep] added missing member ${lower} to server ${svId}`);
+    }
+  }
+  return added;
 }
 
 function clientInfo(ws: WebSocket): Record<string, unknown> | null {
@@ -591,6 +723,7 @@ Deno.serve((req) => {
   ws.onopen = () => console.log("WS connected");
 
   ws.onmessage = async (e) => {
+    { const ci0 = clients.get(ws); if (ci0) ci0.lastActive = Date.now(); }
     // ── Payload size guard ────────────────────────────────────────────────────
     // A single oversized base64 image message can OOM Deno Deploy's isolate.
     // Hard limit: 1.5 MB per message (covers a compressed 800px JPEG at ~700 KB
@@ -816,6 +949,7 @@ Deno.serve((req) => {
         name,
         tag: acct?.tag || "0000",
         color: acct?.color || "#6c63ff", // from the saved account; whatever the client claims is ignored
+        lastActive: Date.now(),
         pfp: safePfp(acct?.pfp),
         token: msg.token,
         systemRole: acct?.systemRole || "user",
@@ -948,15 +1082,35 @@ Deno.serve((req) => {
         else missingServerIds.push(kid);
       }
 
+      // This user's status survives refreshes (invisible must stay invisible). Several tabs share one status.
+      if (!socketsOf(tokenUser).some(([w]) => w !== ws)) {
+        const savedStatus = (await kv.get<string>(["user_status", tokenUser])).value;
+        userStatus.set(tokenUser, savedStatus && VALID_STATUS.has(savedStatus) ? savedStatus : "online");
+      }
+      const myStatus = userStatus.get(tokenUser) || "online";
+
+      // Friends come with their presence, so the friends list is correct the instant it loads.
       const friendsRaw = ((await kv.get<unknown[]>(["friends", tokenUser])).value || []) as Record<string, unknown>[];
-      // Enrich friends with current pfp from their account records
-      const friendsList = await Promise.all(friendsRaw.map(async f => {
-        const fAcct = await kv.get<Record<string, unknown>>(["accounts", (f.name as string || "").toLowerCase()]);
-        return { ...f, pfp: safePfp(fAcct.value?.pfp) || safePfp(f.pfp), color: fAcct.value?.color || f.color || null };
+      const friendsList = await Promise.all(friendsRaw.map(async (f) => {
+        const fl = String(f.name || "").toLowerCase();
+        const fAcct = (await kv.get<Record<string, unknown>>(["accounts", fl])).value;
+        const p = presenceOf(fl, tokenUser);
+        return {
+          name: fAcct?.name || f.name, pfp: safePfp(fAcct?.pfp) || safePfp(f.pfp), color: fAcct?.color || f.color || null,
+          online: p.online, status: p.status, lastSeen: p.online ? null : await getLastSeen(fl),
+        };
       }));
+      // Pending requests in both directions, in the shape the client uses ({name, direction, pfp, color})
       const pendingReqs: unknown[] = [];
-      const reqIter = kv.list({ prefix: ["friend_requests", tokenUser] });
-      for await (const item of reqIter) pendingReqs.push(item.value);
+      for await (const item of kv.list<Record<string, unknown>>({ prefix: ["friend_requests", tokenUser] })) {
+        const v = item.value || {};
+        pendingReqs.push({ name: v.from, direction: "in", pfp: safePfp(v.fromPfp), color: v.fromColor || null, ts: v.ts || 0 });
+      }
+      for await (const item of kv.list<Record<string, unknown>>({ prefix: ["friend_requests_out", tokenUser] })) {
+        const v = item.value || {};
+        const tAcct = (await kv.get<Record<string, unknown>>(["accounts", String(item.key[2])])).value;
+        pendingReqs.push({ name: tAcct?.name || v.to, direction: "out", pfp: safePfp(tAcct?.pfp), color: tAcct?.color || null, ts: v.ts || 0 });
+      }
 
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -972,6 +1126,7 @@ Deno.serve((req) => {
             bio: acct?.bio || "",
             socials: acct?.socials || {},
             createdAt: acct?.createdAt || null,
+            status: myStatus,
           },
           servers: userServers,
           protocol: PROTOCOL,
@@ -981,9 +1136,8 @@ Deno.serve((req) => {
         // Always send pfp state: send null explicitly if the user has none,
         // so the client can clear a stale cached pfp after an admin wipe.
         ws.send(JSON.stringify({ type: "user_pfp", pfp: safePfp(acct?.pfp) }));
-        if ((friendsList as unknown[]).length || (pendingReqs as unknown[]).length) {
-          ws.send(JSON.stringify({ type: "friends_data", friends: friendsList, friendRequests: pendingReqs }));
-        }
+        // Always sent (even when empty) and authoritative: the client replaces its copy instead of merging.
+        ws.send(JSON.stringify({ type: "friends_data", full: true, friends: friendsList, friendRequests: pendingReqs }));
         // Send MOTD if set
         const motdEntry = await kv.get<{ text: string; by: string; at: number }>(["platform", "motd"]);
         if (motdEntry.value?.text) {
@@ -1034,18 +1188,10 @@ Deno.serve((req) => {
         offline.delete(name.toLowerCase());
       }
 
-      // Broadcast member_join to all servers this user belongs to
-      // so other online members see them come online immediately
-      for (const svId of userSvIds) {
-        broadcastToServer(svId, {
-          type: "member_join",
-          serverId: svId,
-          user: acct?.name || name,
-          color: acct?.color || "#6c63ff",
-          pfp: acct?.pfp || null,
-          tag: acct?.tag || "0000",
-        }, ws);
-      }
+      // Tell the people who should know (server co-members + friends) that this user is online. This replaces
+      // the old per-server member_join broadcast, which also fired on every reconnect and could race with the
+      // old connection's close.
+      await announcePresence(tokenUser, (acct?.name as string) || name);
 
       return;
     }
@@ -1338,11 +1484,35 @@ Deno.serve((req) => {
         break;
 
       case "typing":
-      case "member_join":
-      case "member_leave":
-      case "status_update":
         broadcast(msg, ws);
         break;
+
+      // member_join / member_leave / status are generated by the server from real connection state. They are no
+      // longer relayed from clients (anyone could fake "X came online", or set someone else's status).
+      case "status_update": {
+        const st = VALID_STATUS.has(String(msg.status)) ? String(msg.status) : "online";
+        const me = senderName.toLowerCase();
+        userStatus.set(me, st);
+        for (const [, ci] of socketsOf(me)) ci.status = st;
+        await safeKvSet(["user_status", me], st);
+        await announcePresence(me, senderName);
+        break;
+      }
+
+      // Presence of my friends, on demand (e.g. when the friends page opens or the tab regains focus)
+      case "get_presence": {
+        const me = senderName.toLowerCase();
+        const friendSet = new Set((((await kv.get<Array<Record<string, unknown>>>(["friends", me])).value) || []).map((f) => String(f.name || "").toLowerCase()));
+        const out: Record<string, unknown> = {};
+        const asked = Array.isArray(msg.names) ? (msg.names as unknown[]).filter((n): n is string => typeof n === "string").slice(0, 200) : [];
+        for (const n of asked) {
+          const l = n.toLowerCase(); if (!friendSet.has(l)) continue;
+          const p = presenceOf(l, me);
+          out[l] = { name: n, online: p.online, status: p.status, lastSeen: p.online ? null : await getLastSeen(l) };
+        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "presence_snapshot", presence: out }));
+        break;
+      }
 
       case "kick_member": {
         // Used to be a bare broadcast: anyone could "kick" anyone, and the kick was never saved,
@@ -2010,7 +2180,12 @@ Deno.serve((req) => {
         // Confirm to the joiner with the authoritative server record (channels, roles, count)
         ws.send(JSON.stringify({ type: "join_ok", serverId: jsvId }));
         ws.send(JSON.stringify({ type: "server_info", server: await serverInfoFor(jsvId, jsvFresh, true) }));
-        if (!alreadyMember) broadcast(msg, ws);
+        if (!alreadyMember) {
+          broadcast(msg, ws);
+          // so open member lists add them right away (the broadcast above only bumps the count)
+          const jAcct = (await kv.get<Record<string, unknown>>(["accounts", senderName.toLowerCase()])).value;
+          if (jAcct) broadcastToServer(jsvId, { type: "member_join", serverId: jsvId, member: { ...profileOf(jAcct), online: true, status: userStatus.get(senderName.toLowerCase()) || "online" } }, ws);
+        }
         break;
       }
 
@@ -2117,72 +2292,21 @@ Deno.serve((req) => {
 
       case "get_members": {
         const svId = msg.serverId as string;
-        const onlineNamesLower = new Set<string>();
-        const onlineMembers = [];
-        // Only include online users who are actually members of this server
-        for (const [, ci] of clients) {
-          if (!ci.name) continue;
-          // Check case-insensitively — server_member keys may have been stored with original case
-          const nameLower = (ci.name as string).toLowerCase();
-          const memCheck = await kv.get(["server_member", svId, ci.name as string]);
-          // Also try lowercase variant in case of legacy key
-          const memCheckLower = memCheck.value ? memCheck : await kv.get(["server_member", svId, nameLower]);
-          if (memCheck.value || memCheckLower.value) {
-            if (!onlineNamesLower.has(nameLower)) {
-              onlineNamesLower.add(nameLower);
-              onlineMembers.push({ name: ci.name, tag: ci.tag, color: ci.color, pfp: ci.pfp, systemRole: ci.systemRole, coAdmin: ci.coAdmin, online: true });
-            }
-          }
+        const reqId = msg.reqId;
+        const viewer = senderName.toLowerCase();
+        // Only members can see who else is in a server
+        if (!svId || !((info.serverIds as Set<string> | undefined)?.has(svId) || isPowerUser)) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: svId, reqId, members: [] }));
+          break;
         }
-        const memIter2 = kv.list({ prefix: ["server_member", svId] });
-        const offlineMembers = [];
-        const allKnownLower = new Set(onlineNamesLower);
-        for await (const item of memIter2) {
-          const mName = item.key[2] as string;
-          const mNameLower = mName.toLowerCase();
-          if (!allKnownLower.has(mNameLower)) {
-            allKnownLower.add(mNameLower);
-            const mAcct = await kv.get<Record<string, unknown>>(["accounts", mNameLower]);
-            if (mAcct.value) offlineMembers.push({ name: mAcct.value.name, tag: mAcct.value.tag, color: mAcct.value.color, pfp: mAcct.value.pfp, systemRole: mAcct.value.systemRole, coAdmin: mAcct.value.coAdmin, online: false });
-          }
+        // Reply right away with a fast, consistent list...
+        const members = await buildMemberList(svId, viewer);
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: svId, reqId, members }));
+        // ...then (at most every 10 minutes per server) look for people missing from the member records, and
+        // send an updated list if any were found.
+        if (await ghostSweep(svId) > 0 && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "member_list", serverId: svId, reqId, members: await buildMemberList(svId, viewer) }));
         }
-        // Ghost-member sweep: scan recent channel history for message authors not in the list.
-        // If someone chatted here but isn't in server_member (data inconsistency / migration gap),
-        // add them to the offline list and back-fill their membership so future lookups are correct.
-        const svEntry4 = await kv.get<Record<string,unknown>>(["servers", svId]);
-        const svChannels4 = (svEntry4.value?.channels as Array<{ id: string }>) || [];
-        for (const ch of svChannels4) {
-          const chHist4 = (await kv.get<unknown[]>(["ch_history", ch.id])).value || [];
-          for (const m of chHist4) {
-            const mm = m as Record<string, unknown>;
-            const authorRaw = mm.author as string | undefined;
-            if (!authorRaw) continue;
-            const authorLower = authorRaw.toLowerCase();
-            if (allKnownLower.has(authorLower)) continue;
-            allKnownLower.add(authorLower);
-            const ghostAcct = await kv.get<Record<string, unknown>>(["accounts", authorLower]);
-            if (!ghostAcct.value) continue;
-            // Back-fill server membership so this user shows up correctly going forward
-            await kv.set(["server_member", svId, ghostAcct.value.name as string], { joinedAt: Date.now(), addedBy: "ghost-sweep" });
-            await addServerToUser(authorLower, svId);
-            const isOnline = [...clients.values()].some(ci => (ci.name as string)?.toLowerCase() === authorLower);
-            if (isOnline) {
-              onlineMembers.push({ name: ghostAcct.value.name, tag: ghostAcct.value.tag, color: ghostAcct.value.color, pfp: ghostAcct.value.pfp, systemRole: ghostAcct.value.systemRole, coAdmin: ghostAcct.value.coAdmin, online: true });
-            } else {
-              offlineMembers.push({ name: ghostAcct.value.name, tag: ghostAcct.value.tag, color: ghostAcct.value.color, pfp: ghostAcct.value.pfp, systemRole: ghostAcct.value.systemRole, coAdmin: ghostAcct.value.coAdmin, online: false });
-            }
-            console.log(`[ghost-sweep] added missing member ${authorLower} to server ${svId}`);
-          }
-        }
-        // One consistent profile per member, always read from the saved account. Online entries used to take
-        // the picture/color from per-connection state (whatever that client had claimed or last sent), which
-        // is why the same person's avatar differed depending on where you looked.
-        const memberOut: Record<string, unknown>[] = [];
-        for (const entry of [...onlineMembers, ...offlineMembers] as Record<string, unknown>[]) {
-          const acctNow = (await kv.get<Record<string, unknown>>(["accounts", String(entry.name).toLowerCase()])).value;
-          memberOut.push(acctNow ? { ...profileOf(acctNow), online: entry.online } : { ...entry, pfp: safePfp(entry.pfp) });
-        }
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "member_list", serverId: msg.serverId, members: memberOut }));
         break;
       }
 
@@ -2228,59 +2352,82 @@ Deno.serve((req) => {
         break;
 
       case "friend_request": {
-        // Store the incoming request in KV so the recipient gets it even if they're offline
-        const frTo = (msg.to as string || "").toLowerCase();
-        if (!frTo) break;
-        const frKey = ["friend_requests", frTo, senderName.toLowerCase()];
-        await kv.set(frKey, { from: senderName, fromPfp: msg.fromPfp || null, fromColor: msg.fromColor || null, ts: Date.now() });
-        sendToUser(msg.to as string, msg, true);
+        const me = senderName.toLowerCase();
+        const toLower = String(msg.to || "").trim().toLowerCase();
+        const fail = (reason: string) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "friend_request_result", ok: false, reason, to: msg.to })); };
+        if (!toLower) break;
+        if (toLower === me) { fail("self"); break; }
+        const target = (await kv.get<Record<string, unknown>>(["accounts", toLower])).value;
+        if (!target) { fail("not_found"); break; }
+        const myFriends = (((await kv.get<Array<Record<string, unknown>>>(["friends", me])).value) || []);
+        if (myFriends.some((f) => String(f.name).toLowerCase() === toLower)) { fail("already_friends"); break; }
+        // They had already asked me: two requests crossing means "yes"
+        if ((await kv.get(["friend_requests", me, toLower])).value) { await makeFriends(me, toLower); break; }
+        if ((await kv.get(["friend_requests", toLower, me])).value) { fail("already_sent"); break; }
+        let outN = 0;
+        for await (const _ of kv.list({ prefix: ["friend_requests_out", me] })) { if (++outN >= 50) break; }
+        if (outN >= 50) { fail("too_many"); break; }
+        const myAcct = (await kv.get<Record<string, unknown>>(["accounts", me])).value;
+        // `from` is the logged-in name, never what the message claims (it used to be spoofable)
+        await kv.set(["friend_requests", toLower, me], { from: senderName, fromPfp: safePfp(myAcct?.pfp), fromColor: myAcct?.color || null, ts: Date.now() });
+        await kv.set(["friend_requests_out", me, toLower], { to: target.name, ts: Date.now() });
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "friend_request_result", ok: true, to: target.name, pfp: safePfp(target.pfp), color: target.color || null }));
+        sendToUser(target.name as string, { type: "friend_request", from: senderName, fromPfp: safePfp(myAcct?.pfp), fromColor: myAcct?.color || null }, true);
         break;
       }
 
       case "friend_accept": {
-        const faTo = (msg.to as string || "").toLowerCase();
-        if (!faTo) break;
-        // Delete the pending request from KV
-        await kv.delete(["friend_requests", senderName.toLowerCase(), faTo]);
-        await kv.delete(["friend_requests", faTo, senderName.toLowerCase()]);
-        // Add each user to the other's friends list in KV
-        const faMyKey = ["friends", senderName.toLowerCase()];
-        const faTheirKey = ["friends", faTo];
-        const faMyList = ((await kv.get<unknown[]>(faMyKey)).value || []) as Record<string, unknown>[];
-        const faTheirList = ((await kv.get<unknown[]>(faTheirKey)).value || []) as Record<string, unknown>[];
-        if (!faMyList.find(f => (f.name as string)?.toLowerCase() === faTo)) {
-          faMyList.push({ name: msg.to, pfp: null, color: null });
-          await kv.set(faMyKey, faMyList);
+        const me = senderName.toLowerCase();
+        const to = String(msg.to || "").trim().toLowerCase();
+        if (!to) break;
+        // Only an actual pending request can be accepted. Before, "friend_accept" with no request at all
+        // simply added the sender to anyone's friends list.
+        if (!(await kv.get(["friend_requests", me, to])).value) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "friend_request_result", ok: false, reason: "no_request", to: msg.to }));
+          break;
         }
-        if (!faTheirList.find(f => (f.name as string)?.toLowerCase() === senderName.toLowerCase())) {
-          faTheirList.push({ name: senderName, pfp: msg.fromPfp || null, color: msg.fromColor || null });
-          await kv.set(faTheirKey, faTheirList);
-        }
-        sendToUser(msg.to as string, msg, true);
+        await makeFriends(me, to);
         break;
       }
 
       case "friend_decline": {
-        const fdTo = (msg.to as string || "").toLowerCase();
-        // Remove the pending request from KV
-        await kv.delete(["friend_requests", senderName.toLowerCase(), fdTo]);
-        await kv.delete(["friend_requests", fdTo, senderName.toLowerCase()]);
-        sendToUser(msg.to as string, msg, true);
+        const me = senderName.toLowerCase();
+        const to = String(msg.to || "").trim().toLowerCase();
+        if (!to) break;
+        await kv.delete(["friend_requests", me, to]);
+        await kv.delete(["friend_requests_out", to, me]);
+        const tAcct = (await kv.get<Record<string, unknown>>(["accounts", to])).value;
+        if (tAcct) sendToUser(tAcct.name as string, { type: "friend_decline", from: senderName }, true);
+        break;
+      }
+
+      // Take back a request I sent
+      case "friend_cancel": {
+        const me = senderName.toLowerCase();
+        const to = String(msg.to || "").trim().toLowerCase();
+        if (!to) break;
+        await kv.delete(["friend_requests", to, me]);
+        await kv.delete(["friend_requests_out", me, to]);
+        const tAcct = (await kv.get<Record<string, unknown>>(["accounts", to])).value;
+        if (tAcct) sendToUser(tAcct.name as string, { type: "friend_request_cancelled", from: senderName }, false);
         break;
       }
 
       case "friend_remove": {
-        const frmTarget = (msg.target as string || "").toLowerCase();
-        if (!frmTarget) break;
-        // Remove from both sides in KV
-        const frmMyKey = ["friends", senderName.toLowerCase()];
-        const frmTheirKey = ["friends", frmTarget];
-        const frmMyList = ((await kv.get<unknown[]>(frmMyKey)).value || []) as Record<string, unknown>[];
-        const frmTheirList = ((await kv.get<unknown[]>(frmTheirKey)).value || []) as Record<string, unknown>[];
-        await kv.set(frmMyKey, frmMyList.filter(f => (f.name as string)?.toLowerCase() !== frmTarget));
-        await kv.set(frmTheirKey, frmTheirList.filter(f => (f.name as string)?.toLowerCase() !== senderName.toLowerCase()));
-        // Notify the other user if online
-        sendToUser(msg.target as string, { type: "friend_removed", by: senderName }, false);
+        const me = senderName.toLowerCase();
+        const target = String(msg.target || "").trim().toLowerCase();
+        if (!target) break;
+        for (const [owner, other] of [[me, target], [target, me]]) {
+          await withLock("friends:" + owner, async () => {
+            const key = ["friends", owner];
+            const list = (((await kv.get<Array<Record<string, unknown>>>(key)).value) || []);
+            await kv.set(key, list.filter((f) => String(f.name).toLowerCase() !== other));
+          });
+        }
+        const tAcct = (await kv.get<Record<string, unknown>>(["accounts", target])).value;
+        // the other person, and my own other tabs
+        if (tAcct) sendToUser(tAcct.name as string, { type: "friend_removed", by: senderName }, false);
+        sendToUser(senderName, { type: "friend_removed", by: tAcct?.name || msg.target }, false);
         break;
       }
 
@@ -3451,13 +3598,20 @@ Deno.serve((req) => {
     }
   } // end handleMsg
 
-  ws.onclose = () => {
+  ws.onclose = async () => {
     const info = clientInfo(ws);
-    if (info) {
-      broadcast({ type: "member_leave", user: info.name, serverId: "__all__" });
-      console.log("Disconnected:", info.name);
-      // Remove from any active calls
+    clients.delete(ws);
+    if (info?.name) {
       const userName = info.name as string;
+      const lower = userName.toLowerCase();
+      console.log("Disconnected:", userName);
+      // Only when this was their LAST connection are they actually offline. (Announcing on every close made
+      // everyone show as offline right after a refresh or when one of two tabs was closed.)
+      if (!socketsOf(lower).length) {
+        await safeKvSet(["last_seen", lower], Date.now());
+        await announcePresence(lower, userName, info.serverIds as Set<string> | undefined);
+      }
+      // Remove from any active calls
       for (const [callId, call] of activeCalls) {
         call.participants.delete(userName);
         if (call.participants.size === 0) activeCalls.delete(callId);
@@ -3467,7 +3621,6 @@ Deno.serve((req) => {
         if (ghostUser === userName) ghostCalls.delete(callId);
       }
     }
-    clients.delete(ws);
   };
 
   ws.onerror = (err) => console.error("WS error:", err);
