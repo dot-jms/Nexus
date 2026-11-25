@@ -12,7 +12,7 @@ const DEPLOY_VERSION = "v1";
 console.log(`[nexus] deploy version: ${DEPLOY_VERSION}`);
 // Bumped whenever the client and server must change together. The client compares this on every connect and
 // warns if the server it talks to is older than it needs (a stale deploy looks fine until you refresh).
-const PROTOCOL = 6;
+const PROTOCOL = 7;
 console.log(`[nexus] server protocol v${PROTOCOL}`);
 
 // ─── KV setup ───────────────────────────────────────────────────────────────
@@ -757,10 +757,62 @@ function validPfp(v: unknown): v is string {
   return typeof v === "string" && v.length <= PFP_MAX_CHARS && /^data:image\/(?:jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(v);
 }
 function safePfp(v: unknown): string | null { return validPfp(v) ? v : null; }
+const SOCIAL_KEYS = ["website", "twitter", "github", "youtube", "twitch", "instagram", "bluesky"] as const;
 function cleanSocials(v: unknown, fallback: unknown): Record<string, string> {
   const src = (v && typeof v === "object" ? v : (fallback && typeof fallback === "object" ? fallback : {})) as Record<string, unknown>;
   const ok = (s: unknown) => typeof s === "string" && s.length <= 100 && /^[^\s"'<>]*$/.test(s) && !/^(?:javascript|data|vbscript):/i.test(s) ? s : "";
-  return { website: ok(src.website), twitter: ok(src.twitter) };
+  const out: Record<string, string> = {};
+  for (const k of SOCIAL_KEYS) out[k] = ok(src[k]);
+  return out;
+}
+
+// ─── Profile personalisation (protocol 7) ────────────────────────────────────
+// Banner, avatar frame, name effect, card tint, pronouns, location, interests. Everything is whitelisted and
+// validated: colours end up in CSS custom properties and text ends up in markup on every client.
+// Stored OUTSIDE the account record (key ["profile_ext", name]) so a big picture can never push the account over the
+// 64 KiB KV limit, together with the optional banner image (sent only when a profile page is opened).
+const BANNER_IMG_MAX = 50_000;
+function validBannerImg(v: unknown): v is string {
+  return typeof v === "string" && v.length <= BANNER_IMG_MAX && /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v);
+}
+function hexOr(v: unknown, fb: string | null): string | null {
+  if (typeof v !== "string" || !/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v)) return fb;
+  const h = v.toLowerCase();
+  return h.length === 4 ? "#" + h[1] + h[1] + h[2] + h[2] + h[3] + h[3] : h;
+}
+function cleanText(v: unknown, max: number): string {
+  return typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, max) : "";
+}
+const BANNER_KINDS = ["default", "color", "gradient", "image"];
+const FRAME_KINDS = ["none", "ring", "gradient", "glow", "neon", "dashed"];
+const NAMEFX_KINDS = ["none", "gradient", "glow", "shimmer"];
+function cleanExt(v: unknown, fallback: unknown, hasBannerImg: boolean): Record<string, unknown> {
+  const isObj = (x: unknown) => !!x && typeof x === "object" && !Array.isArray(x);
+  const src = (isObj(v) ? v : (isObj(fallback) ? fallback : {})) as Record<string, unknown>;
+  const sub = (x: unknown) => (isObj(x) ? x : {}) as Record<string, unknown>;
+  const pick = (x: unknown, list: string[], fb: string) => (list.includes(x as string) ? (x as string) : fb);
+  const b = sub(src.banner), fr = sub(src.frame), nf = sub(src.nameFx);
+  let bkind = pick(b.kind, BANNER_KINDS, "default");
+  if (bkind === "image" && !hasBannerImg) bkind = "default";
+  const ang = Math.round(Number(b.angle));
+  const seen = new Set<string>();
+  const interests: string[] = [];
+  for (const x of Array.isArray(src.interests) ? src.interests : []) {
+    const t = cleanText(x, 20); if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase()); interests.push(t); if (interests.length >= 8) break;
+  }
+  return {
+    pronouns: cleanText(src.pronouns, 24), location: cleanText(src.location, 30), interests,
+    banner: { kind: bkind, c1: hexOr(b.c1, "#5865f2"), c2: hexOr(b.c2, "#eb459e"), angle: Number.isFinite(ang) ? Math.max(0, Math.min(360, ang)) : 135 },
+    frame: { kind: pick(fr.kind, FRAME_KINDS, "none"), c1: hexOr(fr.c1, "#5865f2"), c2: hexOr(fr.c2, "#eb459e") },
+    nameFx: { kind: pick(nf.kind, NAMEFX_KINDS, "none"), c1: hexOr(nf.c1, "#5865f2"), c2: hexOr(nf.c2, "#eb459e") },
+    cardTint: hexOr(src.cardTint, null),
+  };
+}
+async function getProfileExt(lowerName: string): Promise<{ ext: Record<string, unknown>; banner: string | null }> {
+  const v = (await kv.get<Record<string, unknown>>(["profile_ext", lowerName])).value;
+  const banner = validBannerImg(v?.banner) ? (v!.banner as string) : null;
+  return { ext: cleanExt(v?.ext, null, !!banner), banner };
 }
 // The only account fields other people may see. One shape, used everywhere, always from the saved account.
 function profileOf(a: Record<string, unknown>): Record<string, unknown> {
@@ -1432,6 +1484,8 @@ Deno.serve((req) => {
         // Always send pfp state: send null explicitly if the user has none,
         // so the client can clear a stale cached pfp after an admin wipe.
         ws.send(JSON.stringify({ type: "user_pfp", pfp: safePfp(acct?.pfp) }));
+        // Own profile style (protocol 7), incl. the banner image. Always sent, so a cleared one clears on the client too.
+        { const pe = await getProfileExt(String(tokenUser).toLowerCase()); ws.send(JSON.stringify({ type: "user_ext", ext: pe.ext, banner: pe.banner })); }
         // Always sent (even when empty) and authoritative: the client replaces its copy instead of merging.
         ws.send(JSON.stringify({ type: "friends_data", full: true, friends: friendsList, friendRequests: pendingReqs }));
         // Send MOTD if set
@@ -1628,12 +1682,28 @@ Deno.serve((req) => {
       for (const [, ci] of clients) {
         if ((ci.name as string)?.toLowerCase() === senderName.toLowerCase()) { ci.color = safeColor; ci.pfp = newPfp; ci.bio = safeBio; }
       }
+      // Personalisation (protocol 7): only touched when the message carries it, so an old client or a bio-only edit
+      // can never reset someone's banner or frame.
+      let savedExt: Record<string, unknown> | undefined;
+      if ("ext" in msg || "bannerImg" in msg) {
+        const lowerMe = senderName.toLowerCase();
+        const cur = await getProfileExt(lowerMe);
+        let banner = cur.banner;
+        if ("bannerImg" in msg) {
+          if (msg.bannerImg === null) banner = null;
+          else if (validBannerImg(msg.bannerImg)) banner = msg.bannerImg;
+          else ws.send(JSON.stringify({ type: "error", message: "That banner couldn't be saved. Use a JPEG, PNG or WebP under about 37 KB." }));
+        }
+        const ext = cleanExt("ext" in msg ? msg.ext : cur.ext, cur.ext, !!banner);
+        if (await safeKvSet(["profile_ext", lowerMe], { ext, banner })) savedExt = ext;
+        else ws.send(JSON.stringify({ type: "error", message: "Couldn't save your profile style. Try a smaller banner." }));
+      }
       // Tell everyone else. Built from what was SAVED and from the logged-in name, never from the raw message:
       // before, `user` was whatever the client typed, so anyone could overwrite another person's profile on
       // everybody's screen.
-      broadcast({ type: "profile_update", user: entry.value.name, color: safeColor, pfp: newPfp, bio: safeBio, socials }, ws);
+      broadcast({ type: "profile_update", user: entry.value.name, color: safeColor, pfp: newPfp, bio: safeBio, socials, ext: savedExt }, ws);
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "profile_update_confirm", color: safeColor, pfp: newPfp, bio: safeBio, socials }));
+        ws.send(JSON.stringify({ type: "profile_update_confirm", color: safeColor, pfp: newPfp, bio: safeBio, socials, ext: savedExt }));
       }
       return;
     }
@@ -2681,7 +2751,13 @@ Deno.serve((req) => {
         const gpOut: Record<string, unknown>[] = [];
         for (const n of new Set(gpNames.slice(0, 60).map((x) => x.toLowerCase()))) {
           const a = (await kv.get<Record<string, unknown>>(["accounts", n])).value;
-          if (a) gpOut.push(profileOf(a));
+          if (a) {
+            const p = profileOf(a), pe = await getProfileExt(n);
+            p.ext = pe.ext;
+            // the (large) banner image only goes out when a profile page is opened, never in bulk lookups
+            if (msg.full === true && gpNames.length <= 3 && pe.banner) p.bannerImg = pe.banner;
+            gpOut.push(p);
+          }
         }
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "profiles", profiles: gpOut }));
         break;
@@ -3435,6 +3511,11 @@ Deno.serve((req) => {
           }
           console.log(`[rename] migrated friends + friend requests ${targetLower} → ${newNameLower}`);
         }
+        // 6d. profile style + banner (protocol 7) is keyed by name too
+        {
+          const pe = (await kv.get<Record<string, unknown>>(["profile_ext", targetLower])).value;
+          if (pe) { await safeKvSet(["profile_ext", newNameLower], pe); await kv.delete(["profile_ext", targetLower]); }
+        }
         broadcast({ type: "admin_rename_ok", oldName: target, newName }, null);
 
         // 7. Migrate in-memory offline queue so queued messages reach the renamed user
@@ -4030,6 +4111,7 @@ Deno.serve((req) => {
 
         // 1. Delete account
         await kv.delete(["accounts", nukeTarget]);
+        await kv.delete(["profile_ext", nukeTarget]);
 
         // 2. Delete all sessions
         const nukeSessIter = kv.list<string>({ prefix: ["sessions"] });
