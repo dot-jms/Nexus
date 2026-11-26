@@ -12,7 +12,7 @@ const DEPLOY_VERSION = "v1";
 console.log(`[nexus] deploy version: ${DEPLOY_VERSION}`);
 // Bumped whenever the client and server must change together. The client compares this on every connect and
 // warns if the server it talks to is older than it needs (a stale deploy looks fine until you refresh).
-const PROTOCOL = 7;
+const PROTOCOL = 8;
 console.log(`[nexus] server protocol v${PROTOCOL}`);
 
 // ─── KV setup ───────────────────────────────────────────────────────────────
@@ -809,10 +809,49 @@ function cleanExt(v: unknown, fallback: unknown, hasBannerImg: boolean): Record<
     cardTint: hexOr(src.cardTint, null),
   };
 }
+// Frames and name effects are an admin / co-admin perk: for everybody else they are always "none", whatever is stored.
+function gateExt(ext: Record<string, unknown>, acct: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (acct && (acct.systemRole === "admin" || acct.coAdmin === true)) return ext;
+  return { ...ext, frame: { ...(ext.frame as Record<string, unknown>), kind: "none" }, nameFx: { ...(ext.nameFx as Record<string, unknown>), kind: "none" } };
+}
+// ─── Roles: appearance + permissions, validated (colours end up in CSS on every member's client) ───
+const ROLE_FX_KINDS = ["none", "gradient", "glow", "shimmer", "rainbow"];
+const ROLE_PERMS = ["manage_channels", "manage_messages", "kick_members", "ban_members", "pin_messages", "invite_members", "manage_roles", "manage_server"];
+function cleanRoleLook(r: Record<string, unknown>, owner: boolean): Record<string, unknown> {
+  const color = hexOr(r.color, "#9090a8") as string;
+  const perms = owner ? ["*"] : (Array.isArray(r.perms) ? [...new Set((r.perms as unknown[]).filter((p): p is string => typeof p === "string" && ROLE_PERMS.includes(p)))] : []);
+  return {
+    name: cleanText(r.name, 32), color, color2: hexOr(r.color2, color) as string,
+    fx: ROLE_FX_KINDS.includes(r.fx as string) ? r.fx : "none", icon: cleanText(r.icon, 8), hoist: r.hoist === true, perms,
+  };
+}
+function cleanRoles(v: unknown): Record<string, unknown>[] | null {
+  if (!Array.isArray(v) || v.length > 50) return null;
+  const out: Record<string, unknown>[] = [], seen = new Set<string>();
+  for (const r of v) {
+    if (!r || typeof r !== "object" || typeof (r as Record<string, unknown>).id !== "string") return null;
+    const id = (r as Record<string, unknown>).id as string;
+    if (!id || id.length > 64 || /[^A-Za-z0-9_-]/.test(id) || seen.has(id) || id === "owner" || id === "mod" || id === "member") return null;
+    const look = cleanRoleLook(r as Record<string, unknown>, false); if (!look.name) return null;
+    seen.add(id); out.push({ id, ...look });
+  }
+  return out;
+}
+function cleanRoleOverrides(v: unknown): Record<string, Record<string, unknown>> | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const id of ["owner", "mod", "member"]) {
+    const r = (v as Record<string, unknown>)[id]; if (!r || typeof r !== "object") continue;
+    const look = cleanRoleLook(r as Record<string, unknown>, id === "owner"); if (!look.name) return null;
+    out[id] = look;
+  }
+  return out;
+}
 async function getProfileExt(lowerName: string): Promise<{ ext: Record<string, unknown>; banner: string | null }> {
   const v = (await kv.get<Record<string, unknown>>(["profile_ext", lowerName])).value;
   const banner = validBannerImg(v?.banner) ? (v!.banner as string) : null;
-  return { ext: cleanExt(v?.ext, null, !!banner), banner };
+  const acct = (await kv.get<Record<string, unknown>>(["accounts", lowerName])).value;
+  return { ext: gateExt(cleanExt(v?.ext, null, !!banner), acct), banner };
 }
 // The only account fields other people may see. One shape, used everywhere, always from the saved account.
 function profileOf(a: Record<string, unknown>): Record<string, unknown> {
@@ -1695,7 +1734,7 @@ Deno.serve((req) => {
           else ws.send(JSON.stringify({ type: "error", message: "That banner couldn't be saved. Use a JPEG, PNG or WebP under about 37 KB." }));
         }
         const ext = cleanExt("ext" in msg ? msg.ext : cur.ext, cur.ext, !!banner);
-        if (await safeKvSet(["profile_ext", lowerMe], { ext, banner })) savedExt = ext;
+        if (await safeKvSet(["profile_ext", lowerMe], { ext, banner })) savedExt = gateExt(ext, entry.value);
         else ws.send(JSON.stringify({ type: "error", message: "Couldn't save your profile style. Try a smaller banner." }));
       }
       // Tell everyone else. Built from what was SAVED and from the logged-in name, never from the raw message:
@@ -2158,24 +2197,22 @@ Deno.serve((req) => {
       }
 
       case "roles_update": {
-        // Persist custom roles to server record
-        const ruSvId = msg.serverId as string;
+        // Custom roles + per-server overrides of the built-in ones (owner / mod / member): validated, saved, and
+        // only then shown to everybody else (this used to be relayed unchecked, and overrides were never saved).
+        const ruSvId = String(msg.serverId || "");
         const ruKey = ["servers", ruSvId];
         const ruEntry = await kv.get<Record<string,unknown>>(ruKey);
-        if (ruEntry.value) {
-          const stored = ruEntry.value;
-          const storedOwnerLower = (stored.ownerIdLower as string || (stored.ownerId as string || "").toLowerCase());
-          if (storedOwnerLower === senderName.toLowerCase() || isAdmin || isCoAdmin) {
-            const ruRoles = msg.roles;
-            const ruOk = Array.isArray(ruRoles) && ruRoles.length <= 50 && byteLen(ruRoles) <= 20_000 &&
-              ruRoles.every((r) => r && typeof r.id === "string" && r.id && r.id.length <= 64 && typeof r.name === "string");
-            if (!ruOk) { ws.send(JSON.stringify({ type: "error", message: "Those roles couldn't be saved." })); break; }
-            if (await safeKvSet(ruKey, { ...stored, roles: ruRoles })) {
-              if (publicServers.has(ruSvId)) publicServers.get(ruSvId)!.roles = ruRoles;
-            }
-          }
-        }
-        broadcast(msg, ws);
+        if (!ruEntry.value) break;
+        const stored = ruEntry.value;
+        const storedOwnerLower = (stored.ownerIdLower as string || (stored.ownerId as string || "").toLowerCase());
+        if (!(storedOwnerLower === senderName.toLowerCase() || isAdmin || isCoAdmin)) { ws.send(JSON.stringify({ type: "error", message: "Only the server owner or an admin can edit roles." })); break; }
+        let ruRoles = stored.roles as unknown, ruOv = stored.roleOverrides as unknown;
+        if (msg.roles !== undefined) { const c = cleanRoles(msg.roles); if (!c) { ws.send(JSON.stringify({ type: "error", message: "Those roles couldn't be saved." })); break; } ruRoles = c; }
+        if (msg.overrides !== undefined) { const c = cleanRoleOverrides(msg.overrides); if (!c) { ws.send(JSON.stringify({ type: "error", message: "Those roles couldn't be saved." })); break; } ruOv = c; }
+        if (await safeKvSet(ruKey, { ...stored, roles: ruRoles, roleOverrides: ruOv })) {
+          if (publicServers.has(ruSvId)) { const p = publicServers.get(ruSvId)!; p.roles = ruRoles; p.roleOverrides = ruOv; }
+          broadcast({ type: "roles_update", serverId: ruSvId, roles: ruRoles, overrides: ruOv }, ws);
+        } else ws.send(JSON.stringify({ type: "error", message: "Couldn't save those roles." }));
         break;
       }
 
