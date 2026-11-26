@@ -131,6 +131,97 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   next.finally(() => { if (_locks.get(key) === next) _locks.delete(key); }).catch(() => {});
   return next;
 }
+// ══ ALT / SAME-DEVICE DETECTION ═══════════════════════════════════════════
+// Never uses IPs (VPN-proof). The client sends: random device ids (kept in localStorage + cookie + IndexedDB) and two
+// hashed hardware fingerprints (fp = this browser on this machine, hw = the machine whichever browser). One KV record
+// per account: ["devices", lowername]. Every connect re-reports, so accounts made BEFORE this feature get scanned the next
+// time they log in. Matching is computed on demand (cached 20 s) from those records; nothing else is written.
+type DevRec = { ids: string[]; fp: string[]; hw: string[]; first: number; last: number };
+const DEV_HEX = /^[0-9a-f]{16,64}$/;
+const altAlerted = new Set<string>();
+let altCache: { at: number; rep: Record<string, unknown> } | null = null;
+function cleanDev(raw: unknown): { ids: string[]; fp: string[]; hw: string[] } {
+  const d = (raw && typeof raw === "object") ? raw as Record<string, unknown> : {};
+  const L = (v: unknown, max: number) => (Array.isArray(v) ? v : []).filter((x): x is string => typeof x === "string" && DEV_HEX.test(x)).slice(0, max);
+  return { ids: L(d.ids, 6), fp: L(d.fp, 3), hw: L(d.hw, 3) };
+}
+async function recordDevice(userLower: string, raw: unknown): Promise<boolean> {
+  const d = cleanDev(raw);
+  if (!userLower || (!d.ids.length && !d.fp.length && !d.hw.length)) return false;
+  const key = ["devices", userLower];
+  const now = Date.now();
+  const cur: DevRec = (await kv.get<DevRec>(key)).value || { ids: [], fp: [], hw: [], first: now, last: 0 };
+  let changed = false;
+  const merge = (a: string[], b: string[], max: number) => {
+    for (const x of b) if (!a.includes(x)) { a.push(x); changed = true; }
+    while (a.length > max) a.shift();
+  };
+  merge(cur.ids, d.ids, 8); merge(cur.fp, d.fp, 6); merge(cur.hw, d.hw, 6);
+  if (!changed && now - cur.last < 6 * 3600_000) return false; // nothing new: no write (saves KV usage)
+  cur.last = now;
+  await safeKvSet(key, cur);
+  if (changed) { altCache = null; void altNotify(userLower).catch(() => {}); }
+  return changed;
+}
+const ALT_RANK: Record<string, number> = { certain: 3, likely: 2, possible: 1 };
+async function buildAltReport(): Promise<Record<string, unknown>> {
+  if (altCache && Date.now() - altCache.at < 20_000) return altCache.rep;
+  const recs = new Map<string, DevRec>();
+  for await (const it of kv.list<DevRec>({ prefix: ["devices"] })) if (it.value) recs.set(String(it.key[1]), it.value);
+  const names = new Map<string, string>(); // lower -> display
+  for await (const it of kv.list<Record<string, unknown>>({ prefix: ["accounts"] })) if (it.value?.name) names.set(String(it.key[1]), String(it.value.name));
+  const idx = (field: "ids" | "fp" | "hw") => {
+    const m = new Map<string, Set<string>>();
+    for (const [u, r] of recs) for (const v of r[field]) { if (!m.has(v)) m.set(v, new Set()); m.get(v)!.add(u); }
+    return m;
+  };
+  const byId = idx("ids"), byFp = idx("fp"), byHw = idx("hw");
+  const pairs = new Map<string, { a: string; b: string; level: string; why: Set<string> }>();
+  const bump = (a: string, b: string, level: string, why: string) => {
+    const k = a < b ? a + "\u0000" + b : b + "\u0000" + a;
+    const p = pairs.get(k) || { a: a < b ? a : b, b: a < b ? b : a, level: "possible", why: new Set<string>() };
+    if (ALT_RANK[level] > ALT_RANK[p.level] || !pairs.has(k)) p.level = ALT_RANK[level] > ALT_RANK[p.level] ? level : p.level;
+    p.why.add(why); pairs.set(k, p);
+  };
+  const each = (m: Map<string, Set<string>>, f: (us: string[], size: number) => void) => { for (const s of m.values()) if (s.size > 1) f([...s], s.size); };
+  const mesh = (us: string[], level: string, why: string) => { for (let i = 0; i < us.length; i++) for (let j = i + 1; j < us.length; j++) bump(us[i], us[j], level, why); };
+  each(byId, (us) => mesh(us, "certain", "Same device id (same browser profile / device storage)"));
+  // identical hardware models (school Chromebooks, same phone model) share fingerprints: big groups are downgraded, huge ones ignored
+  each(byFp, (us, n) => { if (n <= 12) mesh(us, n <= 3 ? "likely" : "possible", n <= 3 ? "Same browser fingerprint (GPU, canvas, audio, screen, fonts)" : `Same browser fingerprint, but ${n} accounts share it (common hardware)`); });
+  each(byHw, (us, n) => { if (n <= 3) mesh(us, "possible", "Same hardware profile (maybe a different browser on one machine)"); });
+  const disp = (u: string) => names.get(u) || u;
+  const links = [...pairs.values()].map((p) => ({ a: disp(p.a), b: disp(p.b), level: p.level, why: [...p.why] }));
+  // clusters (union-find over all links)
+  const par = new Map<string, string>(); const find = (x: string): string => { while ((par.get(x) ?? x) !== x) x = par.get(x)!; return x; };
+  for (const p of pairs.values()) { par.set(find(p.a), find(p.b)); }
+  const groups = new Map<string, Set<string>>();
+  for (const p of pairs.values()) for (const u of [p.a, p.b]) { const r = find(u); if (!groups.has(r)) groups.set(r, new Set()); groups.get(r)!.add(u); }
+  const clusters = [...groups.values()].map((s) => {
+    const mem = [...s]; let best = "possible";
+    for (const p of pairs.values()) if (s.has(p.a) && s.has(p.b) && ALT_RANK[p.level] > ALT_RANK[best]) best = p.level;
+    return { level: best, members: mem.map((u) => ({ name: disp(u), last: recs.get(u)?.last || 0 })) };
+  }).sort((x, y) => ALT_RANK[y.level] - ALT_RANK[x.level] || y.members.length - x.members.length);
+  const unscanned = [...names.keys()].filter((u) => !recs.has(u)).map(disp).slice(0, 300);
+  const rep = { clusters, links, unscanned, scanned: recs.size, total: names.size, at: Date.now() };
+  altCache = { at: Date.now(), rep };
+  return rep;
+}
+// new link found -> tell online admins + audit log (once per pair per server instance)
+async function altNotify(userLower: string) {
+  const rep = await buildAltReport() as { links: { a: string; b: string; level: string }[] };
+  const mine = rep.links.filter((l) => l.a.toLowerCase() === userLower || l.b.toLowerCase() === userLower);
+  for (const l of mine) {
+    const k = [l.a, l.b].map((x) => x.toLowerCase()).sort().join("|") + "|" + l.level;
+    if (altAlerted.has(k)) continue; altAlerted.add(k);
+    const other = l.a.toLowerCase() === userLower ? l.b : l.a;
+    const me = l.a.toLowerCase() === userLower ? l.a : l.b;
+    await auditLog("alt_detected", "system", { account: me, linkedTo: other, level: l.level });
+    for (const [sock, ci] of clients) {
+      if ((ci.systemRole === "admin" || ci.coAdmin === true) && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "admin_alt_alert", name: me, other, level: l.level }));
+    }
+  }
+}
+
 const SERVER_RECORD_WRITERS = new Set([
   "channel_add", "channel_update", "channel_remove", "roles_update", "role_assign", "server_update",
   "server_create", "server_delete", "join_server", "leave_server", "kick_member",
@@ -1300,6 +1391,8 @@ Deno.serve((req) => {
     // ── identify ──────────────────────────────────────────────────────────
     if (msg.type === "identify") {
       const key = ["accounts", tokenUser];
+      // alt detection: record device signals (fire-and-forget; skipped for admin "be someone" sessions)
+      if (msg.dev && !assumeTokens.has(msg.token as string)) recordDevice(tokenUser, msg.dev).catch(() => {});
 
       // Banned users with a still-valid token must not slip back in
       if (isBanned(tokenUser)) {
@@ -3549,6 +3642,11 @@ Deno.serve((req) => {
           }
           console.log(`[rename] migrated friends + friend requests ${targetLower} → ${newNameLower}`);
         }
+        // 6e. alt-detection device record is keyed by name too
+        {
+          const dv = (await kv.get<DevRec>(["devices", targetLower])).value;
+          if (dv) { await safeKvSet(["devices", newNameLower], dv); await kv.delete(["devices", targetLower]); altCache = null; }
+        }
         // 6d. profile style + banner (protocol 7) is keyed by name too
         {
           const pe = (await kv.get<Record<string, unknown>>(["profile_ext", targetLower])).value;
@@ -3591,6 +3689,17 @@ Deno.serve((req) => {
         const alertBody = (msg.body as string || "").slice(0, 500);
         if (!alertTitle || !alertBody) { ws.send(JSON.stringify({ type: "error", message: "Alert needs a title and body." })); break; }
         broadcast({ type: "platform_alert", title: alertTitle, body: alertBody, from: senderName }, null);
+        break;
+      }
+
+      case "device_report": {
+        if (!assumeTokens.has(info.token as string)) await recordDevice(senderName.toLowerCase(), msg.dev);
+        break;
+      }
+
+      case "admin_alt_report": {
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        ws.send(JSON.stringify({ type: "admin_alt_report", ...(await buildAltReport()) }));
         break;
       }
 
@@ -4173,6 +4282,7 @@ Deno.serve((req) => {
         // 1. Delete account
         await kv.delete(["accounts", nukeTarget]);
         await kv.delete(["profile_ext", nukeTarget]);
+        await kv.delete(["devices", nukeTarget]); altCache = null;
 
         // 2. Delete all sessions
         const nukeSessIter = kv.list<string>({ prefix: ["sessions"] });
