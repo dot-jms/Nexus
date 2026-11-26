@@ -106,6 +106,7 @@ function callStates(call: CallRec): Record<string, { muted: boolean; deafened: b
 }
 // ghost call watchers: callId → admin username (only one ghost per call for simplicity)
 const ghostCalls = new Map<string, string>();
+const assumeTokens = new Set<string>(); // sessions minted by admin_assume (never refreshed to 30 days)
 // platform maintenance mode — only admins can connect/identify when true
 let maintenanceMode = false;
 // audit log ring buffer (last 500 admin actions, also persisted to KV)
@@ -1348,7 +1349,7 @@ Deno.serve((req) => {
       // This means the next message with this token will verify correctly
       sessions.set(msg.token as string, tokenUser);
       // FIX #7: Refresh expiry on every identify (keeps active sessions alive)
-      await kv.set(["sessions", msg.token as string], tokenUser, { expireIn: 30 * 24 * 60 * 60 * 1000 });
+      if (!assumeTokens.has(msg.token as string)) await kv.set(["sessions", msg.token as string], tokenUser, { expireIn: 30 * 24 * 60 * 60 * 1000 });
       console.log(`[identify] re-persisted session token for ${name}`);
 
       // FIX: Look up user_servers by lowercased token user (consistent key)
@@ -3594,7 +3595,7 @@ Deno.serve((req) => {
       }
 
       case "admin_list_accounts": {
-        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can list accounts." })); break; }
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
         const acctIter2 = kv.list<Record<string, unknown>>({ prefix: ["accounts"] });
         const allAccounts: Record<string, unknown>[] = [];
         for await (const item of acctIter2) {
@@ -3744,7 +3745,7 @@ Deno.serve((req) => {
 
       case "admin_list_servers": {
         // Return all servers with full metadata for the admin panel.
-        if (!isAdmin) { ws.send(JSON.stringify({ type: "error", message: "Only Puck can list all servers." })); break; }
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
         const svIter2 = kv.list<Record<string, unknown>>({ prefix: ["servers"] });
         const allSvs: Record<string, unknown>[] = [];
         for await (const item of svIter2) {
@@ -3760,6 +3761,7 @@ Deno.serve((req) => {
             memberCount: memCount, createdAt: sv.createdAt || 0,
             isPublic: sv.isPublic !== false,
             channelCount: (sv.channels as unknown[] || []).length,
+            channels: ((sv.channels as Record<string, unknown>[]) || []).map(c => ({ id: c.id, name: c.name, type: c.type || "text" })),
           });
         }
         allSvs.sort((a, b) => ((b.memberCount as number) || 0) - ((a.memberCount as number) || 0));
@@ -3834,6 +3836,28 @@ Deno.serve((req) => {
         await kv.delete(["frozen", ufzTarget]);
         sendToUser(ufzTarget, { type: "account_unfrozen", by: senderName }, false);
         ws.send(JSON.stringify({ type: "success", message: `${msg.target} unfrozen.` }));
+        break;
+      }
+
+      case "admin_assume": {
+        // "Be" another user: mint a short-lived session for them; the client reloads into it (per tab).
+        if (!isPowerUser) { ws.send(JSON.stringify({ type: "error", message: "No permission." })); break; }
+        const asTarget = (msg.target as string || "").trim().toLowerCase();
+        const asEntry = asTarget ? await kv.get<Record<string, unknown>>(["accounts", asTarget]) : null;
+        if (!asEntry?.value) { ws.send(JSON.stringify({ type: "error", message: "User not found." })); break; }
+        if (asTarget === senderName.toLowerCase()) { ws.send(JSON.stringify({ type: "error", message: "That's you already." })); break; }
+        if (!isAdmin && (asEntry.value.systemRole === "admin" || asEntry.value.coAdmin === true)) {
+          ws.send(JSON.stringify({ type: "error", message: "Only the system admin can be another admin." })); break;
+        }
+        const asTok = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
+        assumeTokens.add(asTok);
+        sessions.set(asTok, asTarget);
+        await kv.set(["sessions", asTok], asTarget, { expireIn: 12 * 60 * 60 * 1000 });
+        await auditLog("assume", senderName, { target: asEntry.value.name });
+        const av = asEntry.value;
+        ws.send(JSON.stringify({ type: "admin_assume_ok", token: asTok, user: {
+          name: av.name, tag: av.tag || "0000", color: av.color, pfp: safePfp(av.pfp),
+          systemRole: av.systemRole || "user", coAdmin: av.coAdmin || false, bio: av.bio || "" } }));
         break;
       }
 
