@@ -257,6 +257,37 @@ function broadcastToServer(serverId: string, data: unknown, exclude: WebSocket |
   }
 }
 
+// ─── P2P file relay ─────────────────────────────────────────────────────────
+// The server never stores big attachments. Someone who is missing one asks; the server picks ONE online holder candidate
+// (the least busy, random among equals), asks only that person, and moves to the next candidate if they miss or stay silent.
+type FileReq = { rid: string; requester: string; base: Record<string, unknown>; cands: string[]; tried: number; holder: string; timer: ReturnType<typeof setTimeout> | 0 };
+const fileReqs = new Map<string, FileReq>();
+const fileBusy = new Map<string, number>();   // holder (lowercase) -> transfers in flight
+function fileReqFree(fr: FileReq) {
+  if (fr.timer) clearTimeout(fr.timer);
+  if (fr.holder) { fileBusy.set(fr.holder, Math.max(0, (fileBusy.get(fr.holder) || 0) - 1)); fr.holder = ""; }
+}
+function fileReqNext(fr: FileReq) {
+  fileReqFree(fr);
+  while (fr.cands.length && fr.tried < 4) {
+    const next = fr.cands.shift()!; fr.tried++;
+    if (!sendToUser(next, { ...fr.base, rid: fr.rid }, false)) continue;   // not reachable right now
+    fr.holder = next; fileBusy.set(next, (fileBusy.get(next) || 0) + 1);
+    fr.timer = setTimeout(() => fileReqNext(fr), 15000);
+    return;
+  }
+  fileReqs.delete(fr.rid);
+  sendToUser(fr.requester, { type: "video_none", msgId: fr.base.msgId, name: fr.base.name }, false);
+}
+function fileReqStart(requesterLower: string, requesterName: string, base: Record<string, unknown>, cands: string[]) {
+  for (const f of fileReqs.values()) if (f.requester.toLowerCase() === requesterLower && f.base.msgId === base.msgId && f.base.name === base.name) return;   // already being fetched
+  if (fileReqs.size > 400) { const first = fileReqs.values().next().value; if (first) { fileReqFree(first); fileReqs.delete(first.rid); } }
+  const list = [...new Set(cands)].filter((c) => c !== requesterLower).sort(() => Math.random() - 0.5);
+  list.sort((a, b) => (fileBusy.get(a) || 0) - (fileBusy.get(b) || 0));
+  const fr: FileReq = { rid: newId(), requester: requesterName, base, cands: list, tried: 0, holder: "", timer: 0 };
+  fileReqs.set(fr.rid, fr); fileReqNext(fr);
+}
+
 function sendToUser(name: string, data: unknown, queue = true): boolean {
   // BUG 4 FIX: offline queue used mixed-case names as keys, causing misses on flush.
   // Normalize to lowercase so sendToUser("Alice") and offline.get("alice") always match.
@@ -1632,33 +1663,8 @@ Deno.serve((req) => {
           ws.send(JSON.stringify({ type: "account_frozen", reason: fz.reason, by: fz.by }));
         }
 
-        // Send DM contacts so the client can restore its DM sidebar even after a cache clear.
-        // Scan all dm_history keys that include this user and return the other party's info.
-        {
-          const dmContactsMap = new Map<string, { name: string; lastTs: number; last: string; pfp: string | null }>();
-          const dmScanIter = kv.list<unknown[]>({ prefix: ["dm_history"] });
-          for await (const item of dmScanIter) {
-            const keyStr = item.key[1] as string;
-            const parts = keyStr.split(":");
-            if (!parts.some(p => p === tokenUser)) continue;
-            const otherLower = parts.find(p => p !== tokenUser) || "";
-            if (!otherLower || dmContactsMap.has(otherLower)) continue;
-            const msgs = item.value || [];
-            const last = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
-            const otherAcct = await kv.get<Record<string, unknown>>(["accounts", otherLower]);
-            const displayName = (otherAcct.value?.name as string) || otherLower;
-            dmContactsMap.set(otherLower, {
-              name: displayName,
-              lastTs: (last?._stored as number || last?.ts as number || 0),
-              last: (last?.text as string || (Array.isArray((last as Record<string,unknown>)?.attachments) ? "[attachment]" : "")),
-              pfp: safePfp(otherAcct.value?.pfp),
-            });
-          }
-          if (dmContactsMap.size > 0) {
-            const contacts = [...dmContactsMap.values()].sort((a, b) => b.lastTs - a.lastTs);
-            ws.send(JSON.stringify({ type: "dm_contacts", contacts }));
-          }
-        }
+        // (The old login-time scan of every dm_history key was removed: the client asks with fetch_dm_contacts, which sends DMs AND
+        //  groups. The old message had no groups list and made clients forget the groups they created, and it cost a full KV scan per login.)
       }
 
       // Flush queued offline messages
@@ -2193,26 +2199,46 @@ Deno.serve((req) => {
       }
 
       case "video_request": {
-        // Broadcast only to server members — anyone who has this video cached will respond
-        const vrServerId = msg.serverId as string;
-        if (vrServerId) {
-          broadcastToServer(vrServerId, msg, ws);
-        } else {
-          broadcast(msg, ws); // fallback for old messages without serverId
+        const vrMe = senderName.toLowerCase();
+        const vrId = String(msg.msgId || "").slice(0, 80), vrName = String(msg.name || "").slice(0, 200);
+        if (!vrId) break;
+        const base: Record<string, unknown> = { type: "video_request", msgId: vrId, name: vrName, requester: senderName, channelId: typeof msg.channelId === "string" ? msg.channelId.slice(0, 80) : undefined };
+        let cands: string[] = [];
+        if (typeof msg.gid === "string") {             // group chat: members only
+          const g = await getGroup(msg.gid);
+          if (g && (g.members as string[]).includes(vrMe)) cands = (g.members as string[]).filter((l) => l !== vrMe && socketsOf(l).length > 0);
+        } else if (msg.dm === true && typeof msg.with === "string" && msg.with.length <= 64) {   // 1:1 DM: the other person only
+          const o = msg.with.toLowerCase(); if (socketsOf(o).length > 0) cands = [o];
+        } else if (typeof msg.serverId === "string" && msg.serverId) {   // server: members of that server who are online
+          const sid = msg.serverId;
+          if ((info.serverIds as Set<string> | undefined)?.has(sid) || isPowerUser) {
+            for (const [w, ci] of clients) if (w.readyState === WebSocket.OPEN && (ci.serverIds as Set<string> | undefined)?.has(sid)) cands.push(String(ci.name || "").toLowerCase());
+          }
         }
+        if (cands.length) fileReqStart(vrMe, senderName, base, cands);
+        else sendToUser(senderName, { type: "video_none", msgId: vrId, name: vrName }, false);
+        break;
+      }
+      case "video_miss": {   // the asked holder does not have the file: try the next candidate
+        const fr = fileReqs.get(String(msg.rid || ""));
+        if (fr && fr.holder === senderName.toLowerCase()) fileReqNext(fr);
         break;
       }
       case "video_serve": {
-        // BUG 3 FIX: msg.to is user-controlled. A malicious client could target any
-        // username and flood their offline queue with large video payloads (DoS).
-        // Validate: sender must have the video in their own message history context,
-        // and the payload must be a plausible video URL (data: or https:).
+        const rid = typeof msg.rid === "string" ? msg.rid : "";
+        const fr = rid ? fileReqs.get(rid) : undefined;
+        const out: Record<string, unknown> = { ...(msg as Record<string, unknown>) };
+        delete out.token; delete out.rid;
+        if (fr) {   // answer to a request the server routed: only the chosen holder may answer, and it goes to the requester only
+          if (fr.holder !== senderName.toLowerCase()) break;
+          fileReqFree(fr); fileReqs.delete(rid);
+          sendToUser(fr.requester, out, false);
+          break;
+        }
+        // older clients answer without a rid
         const serveTarget = msg.to as string;
-        const serveUrl = msg.url as string || "";
         if (!serveTarget || typeof serveTarget !== "string" || serveTarget.length > 64) break;
-        // Strip the actual video data from what we re-broadcast — only metadata needed to route.
-        // The actual data URL stays in the direct send only, not in any queue.
-        sendToUser(serveTarget, msg, false); // false = don't queue large video payloads
+        sendToUser(serveTarget, out, false); // false = don't queue large payloads
         break;
       }
 
